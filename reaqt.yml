@@ -1,0 +1,48 @@
+---
+- name: Validate data passed from Reaqt
+  hosts: localhost
+  gather_facts: false
+  ansible_connection: local
+  tasks:
+    - name: Ensure a limit was passed to the job
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+        fail_msg: "No limit was passed from Reaqt - refusing to run against all hosts"
+        success_msg: "Limit received: {{ ansible_limit | default('') }}"
+
+    - name: Ensure the 'message' extra var was passed
+      ansible.builtin.assert:
+        that:
+          - message is defined
+          - message | length > 0
+        fail_msg: "Required extra var 'message' was not passed from Reaqt"
+        success_msg: "Extra var 'message' received: {{ message | default('') }}"
+
+    - name: Ensure the 'task_file' extra var was passed
+      ansible.builtin.assert:
+        that:
+          - task_file is defined
+          - task_file | length > 0
+        fail_msg: "Required extra var 'task_file' was not passed from Reaqt"
+        success_msg: "Extra var 'task_file' received: {{ task_file | default('') }}"
+
+    - name: Check that the task file exists in the tasks folder
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/tasks/{{ task_file | basename }}"
+      register: task_file_stat
+
+    - name: Ensure the task file exists in the tasks folder
+      ansible.builtin.assert:
+        that:
+          - task_file_stat.stat.exists
+        fail_msg: "Task file '{{ task_file }}' does not exist in the tasks folder"
+        success_msg: "Task file '{{ task_file }}' found"
+
+- name: Remediate hosts from Reaqt event
+  hosts: all
+  become: true
+  tasks:
+    - name: Run the remediation task file for this event
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/{{ task_file | basename }}"

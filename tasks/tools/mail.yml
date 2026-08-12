@@ -1,0 +1,10 @@
+- name: Send an email for the alert
+  community.general.mail:
+    host: "{{ mail_host }}"
+    port: "{{ mail_port }}"
+    username: "{{ mail_username }}"
+    password: "{{ mail_password}}"
+    to: "{{ mail_to }}"
+    subject: "{{ subject }}"
+    body: "{{ body }}"
+  delegate_to: localhost

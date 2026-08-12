@@ -1,0 +1,242 @@
+---
+# Remediation for disk usage warnings on RHEL-based systems (RHEL, Rocky, Alma).
+#
+# Finds filesystems above disk_usage_threshold percent used, applies safe
+# cleanups appropriate to each mount point, then emails a summary of what
+# was done. All thresholds can be overridden with extra vars.
+
+- name: Remediate disk usage warning
+  vars:
+    disk_usage_threshold: 80
+    kernels_to_keep: 2
+    tmp_max_age_days: 7
+    log_max_age_days: 30
+    journal_max_age_days: 14
+  block:
+    - name: Find filesystems over the usage threshold
+      ansible.builtin.set_fact:
+        full_filesystems: >-
+          {{ full_filesystems | default([]) + [ {
+               'mount': item.mount,
+               'used_pct': ((item.size_total - item.size_available) / item.size_total * 100) | round(1)
+             } ] }}
+      loop: "{{ ansible_mounts }}"
+      loop_control:
+        label: "{{ item.mount }}"
+      when:
+        - item.size_total | int > 0
+        - ((item.size_total - item.size_available) / item.size_total * 100) >= disk_usage_threshold | int
+
+    - name: Work out which cleanup groups apply
+      ansible.builtin.set_fact:
+        full_mounts: "{{ full_filesystems | default([]) | map(attribute='mount') | list }}"
+
+    - name: Show filesystems needing attention
+      ansible.builtin.debug:
+        msg: "Filesystems over {{ disk_usage_threshold }}% used: {{ full_filesystems | default([]) }}"
+
+    # --- /boot ---------------------------------------------------------------
+    - name: Remove kernels older than the most recent {{ kernels_to_keep }}
+      ansible.builtin.command:
+        cmd: dnf -y remove --oldinstallonly --setopt=installonly_limit={{ kernels_to_keep }}
+      register: kernel_cleanup
+      changed_when: "'Complete!' in kernel_cleanup.stdout"
+      failed_when:
+        - kernel_cleanup.rc != 0
+        - "'No old installonly packages' not in kernel_cleanup.stderr"
+      when: "'/boot' in full_mounts"
+
+    # --- / and /tmp ------------------------------------------------------------
+    - name: Find files in /tmp older than {{ tmp_max_age_days }} days
+      ansible.builtin.find:
+        paths: /tmp
+        age: "{{ tmp_max_age_days }}d"
+        recurse: true
+        file_type: file
+      register: old_tmp_files
+      when: full_mounts | intersect(['/', '/tmp']) | length > 0
+
+    - name: Remove old files from /tmp
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_tmp_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # --- / and /var --------------------------------------------------------
+    - name: Force a logrotate run
+      ansible.builtin.command:
+        cmd: logrotate -f /etc/logrotate.conf
+      register: logrotate_run
+      changed_when: true
+      failed_when: false
+      when: full_mounts | intersect(['/', '/var', '/var/log']) | length > 0
+
+    - name: Find log files in /var/log older than {{ log_max_age_days }} days
+      ansible.builtin.find:
+        paths: /var/log
+        age: "{{ log_max_age_days }}d"
+        recurse: true
+        file_type: file
+      register: old_log_files
+      when: full_mounts | intersect(['/', '/var', '/var/log']) | length > 0
+
+    - name: Remove old log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_log_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # Runs as part of the general / and /var cleanup, but also whenever the
+    # alert itself is about journald failing - that can happen before any
+    # filesystem crosses the usage threshold.
+    - name: Trim the systemd journal to {{ journal_max_age_days }} days
+      ansible.builtin.command:
+        cmd: journalctl --vacuum-time={{ journal_max_age_days }}d
+      register: journal_vacuum
+      changed_when: true
+      when: >-
+        full_mounts | intersect(['/', '/var', '/var/log']) | length > 0
+        or 'Failed to create new system journal' in (message | default(''))
+
+    - name: Clean the dnf cache
+      ansible.builtin.command:
+        cmd: dnf clean all
+      register: dnf_clean
+      changed_when: true
+      when: full_mounts | intersect(['/', '/var']) | length > 0
+
+    - name: Find coredumps older than {{ tmp_max_age_days }} days
+      ansible.builtin.find:
+        paths: /var/lib/systemd/coredump
+        age: "{{ tmp_max_age_days }}d"
+        file_type: file
+      register: old_coredumps
+      when: full_mounts | intersect(['/', '/var']) | length > 0
+
+    - name: Remove old coredumps
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_coredumps.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # --- container runtimes --------------------------------------------------
+    - name: Check whether docker is installed
+      ansible.builtin.shell: command -v docker
+      register: docker_check
+      changed_when: false
+      failed_when: false
+      when: full_mounts | intersect(['/', '/var', '/var/lib/docker']) | length > 0
+
+    - name: Prune the docker build cache
+      ansible.builtin.command:
+        cmd: docker builder prune -f
+      register: docker_builder_prune
+      changed_when: true
+      failed_when: false
+      when:
+        - docker_check is not skipped
+        - docker_check.rc == 0
+
+    - name: Prune unused docker data
+      ansible.builtin.command:
+        cmd: docker system prune -f
+      register: docker_system_prune
+      changed_when: true
+      failed_when: false
+      when:
+        - docker_check is not skipped
+        - docker_check.rc == 0
+
+    - name: Check whether podman is installed
+      ansible.builtin.shell: command -v podman
+      register: podman_check
+      changed_when: false
+      failed_when: false
+      when: full_mounts | intersect(['/', '/var', '/var/lib/containers']) | length > 0
+
+    - name: Prune unused podman data
+      ansible.builtin.command:
+        cmd: podman system prune -f
+      register: podman_system_prune
+      changed_when: true
+      failed_when: false
+      when:
+        - podman_check is not skipped
+        - podman_check.rc == 0
+
+  # Reporting runs even if one of the cleanup steps failed, so we always
+  # get an email about what happened.
+  always:
+    - name: Re-read disk usage after cleanup
+      ansible.builtin.setup:
+        gather_subset:
+          - '!all'
+          - '!min'
+          - hardware
+      when: full_mounts | default([]) | length > 0
+
+    - name: Compose the remediation report
+      ansible.builtin.set_fact:
+        disk_report_body: |-
+          Reaqt disk warning remediation ran on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          {% if full_filesystems is not defined or full_filesystems | length == 0 %}
+          No filesystem was found above {{ disk_usage_threshold }}% used.
+          {% if journal_vacuum is defined and journal_vacuum is not skipped %}
+          The alert mentioned a journald failure, so the systemd journal was trimmed to {{ journal_max_age_days }} days.
+          {% else %}
+          No cleanup was performed.
+          {% endif %}
+          {% else %}
+          Filesystem usage (before -> after cleanup):
+          {% for fs in full_filesystems %}
+          {% set m = ansible_mounts | selectattr('mount', 'equalto', fs.mount) | list | first | default({}) %}
+          - {{ fs.mount }}: {{ fs.used_pct }}% -> {{ ((m.size_total - m.size_available) / m.size_total * 100) | round(1) if m else 'unknown' }}%
+          {% endfor %}
+
+          Actions taken:
+          {% if kernel_cleanup is defined and kernel_cleanup is not skipped %}
+          - Removed kernels older than the most recent {{ kernels_to_keep }} to free /boot
+          {% endif %}
+          {% if old_tmp_files is defined and old_tmp_files is not skipped %}
+          - Removed {{ old_tmp_files.files | length }} file(s) from /tmp older than {{ tmp_max_age_days }} days
+          {% endif %}
+          {% if logrotate_run is defined and logrotate_run is not skipped %}
+          - Forced a logrotate run (exit code {{ logrotate_run.rc }})
+          {% endif %}
+          {% if old_log_files is defined and old_log_files is not skipped %}
+          - Removed {{ old_log_files.files | length }} log file(s) from /var/log older than {{ log_max_age_days }} days
+          {% endif %}
+          {% if journal_vacuum is defined and journal_vacuum is not skipped %}
+          - Trimmed the systemd journal to {{ journal_max_age_days }} days
+          {% endif %}
+          {% if dnf_clean is defined and dnf_clean is not skipped %}
+          - Cleaned the dnf cache
+          {% endif %}
+          {% if old_coredumps is defined and old_coredumps is not skipped %}
+          - Removed {{ old_coredumps.files | length }} old coredump(s)
+          {% endif %}
+          {% if docker_builder_prune is defined and docker_builder_prune is not skipped and docker_builder_prune.rc == 0 %}
+          - Pruned docker build cache ({{ docker_builder_prune.stdout_lines | last | default('') }})
+          {% endif %}
+          {% if docker_system_prune is defined and docker_system_prune is not skipped and docker_system_prune.rc == 0 %}
+          - Pruned unused docker data ({{ docker_system_prune.stdout_lines | last | default('') }})
+          {% endif %}
+          {% if podman_system_prune is defined and podman_system_prune is not skipped and podman_system_prune.rc == 0 %}
+          - Pruned unused podman data
+          {% endif %}
+          {% endif %}
+
+    - name: Send the remediation summary email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] Disk remediation on {{ inventory_hostname }}"
+        body: "{{ disk_report_body }}"
+      become: false

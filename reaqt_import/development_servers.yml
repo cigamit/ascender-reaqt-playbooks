@@ -1,0 +1,50 @@
+- name: Development Servers
+  slug: dev-servers
+  token: 450b5cb530ca199df6d59ea715bc92416b3ae8362dad3c74f995c48db8594fb9
+  rules:
+    0:
+      - name: Disk Warning
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Disk Warning
+            condition:
+              - >-
+                'Disk Warning' in event.payload.message
+                or 'No space left on device' in event.payload.message
+                or 'Failed to create new system journal' in event.payload.message
+                or 'disk full' in event.payload.message|lower
+                or 'out of disk space' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: disk_warning.yml
+    1:
+      - name: Log Unknown Errors / Warnings
+        enabled: true
+        triggers:
+          throttle:
+            enabled: false
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Log
+        rule:
+          - name: Rule to process the web
+            condition:
+              - event.payload is defined
+              - "'WARNING:' in event.payload.message|upper or 'ERROR:' in event.payload.message|upper"
