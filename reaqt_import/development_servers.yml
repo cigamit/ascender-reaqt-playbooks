@@ -1,6 +1,5 @@
 - name: Development Servers
   slug: dev-servers
-  token: 450b5cb530ca199df6d59ea715bc92416b3ae8362dad3c74f995c48db8594fb9
   rules:
     0:
       - name: DNS Failure
