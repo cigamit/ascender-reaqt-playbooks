@@ -88,9 +88,10 @@
       failed_when: false
       when: culprit_pid | length > 0
 
+    # The systemd module manages units; it cannot read manager properties,
+    # so systemctl show is the only way to get this value.
     - name: Read the systemd default FD limit
-      ansible.builtin.command:
-        cmd: systemctl show -p DefaultLimitNOFILE --no-pager
+      ansible.builtin.command: systemctl show -p DefaultLimitNOFILE --no-pager # noqa: command-instead-of-module
       register: systemd_fd_limit
       changed_when: false
       failed_when: false

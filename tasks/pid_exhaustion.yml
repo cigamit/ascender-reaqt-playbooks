@@ -45,9 +45,10 @@
       changed_when: false
       failed_when: false
 
+    # The systemd module manages units; it cannot read manager properties,
+    # so systemctl show is the only way to get this value.
     - name: Read the systemd default TasksMax
-      ansible.builtin.command:
-        cmd: systemctl show -p DefaultTasksMax --no-pager
+      ansible.builtin.command: systemctl show -p DefaultTasksMax --no-pager # noqa: command-instead-of-module
       register: default_tasks_max
       changed_when: false
       failed_when: false
