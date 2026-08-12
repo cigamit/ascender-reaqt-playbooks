@@ -1,0 +1,77 @@
+---
+# Diagnostics for software RAID (md) problems.
+#
+# Parses the affected array out of the Reaqt message when possible, collects
+# /proc/mdstat and mdadm --detail for every md array, summarises each
+# array's state (degraded / rebuilding / clean), and emails a report.
+# No remediation is attempted - re-adding or replacing RAID members is not
+# something to automate blindly.
+
+- name: Handle RAID array problem
+  block:
+    - name: Parse the affected array from the Reaqt message
+      ansible.builtin.set_fact:
+        failing_array: "{{ message | default('') | regex_search('\\bmd\\d+\\b') or '' }}"
+
+    - name: Read /proc/mdstat
+      ansible.builtin.command:
+        cmd: cat /proc/mdstat
+      register: mdstat_output
+      changed_when: false
+      failed_when: false
+
+    - name: List md arrays on this host
+      ansible.builtin.shell: awk '/^md/ {print $1}' /proc/mdstat
+      register: md_arrays
+      changed_when: false
+      failed_when: false
+
+    - name: Collect mdadm detail for each array
+      ansible.builtin.command:
+        cmd: mdadm --detail /dev/{{ item }}
+      loop: "{{ md_arrays.stdout_lines | default([]) }}"
+      register: mdadm_details
+      changed_when: false
+      failed_when: false
+
+    - name: Compose the RAID report
+      ansible.builtin.set_fact:
+        raid_report_body: |-
+          Reaqt detected a RAID problem on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+          {% if failing_array | length > 0 %}
+          Array named in the message: /dev/{{ failing_array }}
+          {% endif %}
+
+          {% if md_arrays.stdout_lines | default([]) | length == 0 %}
+          No md (software RAID) arrays were found on this host. If this host uses a
+          hardware RAID controller, check it with the vendor tool (storcli, perccli,
+          ssacli, ...) - those errors do not show up in /proc/mdstat.
+          {% else %}
+          Array states:
+          {% for r in mdadm_details.results %}
+          - /dev/{{ r.item }}: {{ (r.stdout | default('') | regex_search('State :[^\n]*') or 'State : unknown') | regex_replace('State :\s*', '') }}
+          {% endfor %}
+
+          A state of "clean" or "active" is healthy. "degraded" means a member is
+          missing or failed. "recovering" or "resyncing" means a rebuild is in
+          progress - see the progress indicator in /proc/mdstat below.
+          {% endif %}
+
+          --- /proc/mdstat ---
+          {{ mdstat_output.stdout | default('') }}
+
+          {% for r in mdadm_details.results | default([]) %}
+          --- mdadm --detail /dev/{{ r.item }} ---
+          {{ r.stdout | default('') }}
+
+          {% endfor %}
+
+    - name: Send the RAID report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] RAID problem on {{ inventory_hostname }}{{
+          ' - ' ~ failing_array if failing_array | length > 0 else '' }}
+        body: "{{ raid_report_body }}"
+      become: false

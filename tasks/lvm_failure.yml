@@ -1,0 +1,99 @@
+---
+# Diagnostics and light remediation for LVM problems.
+#
+# Collects pvs/vgs/lvs/lvscan output, highlights missing PVs and inactive
+# LVs, and - only when the alert was about a failed activation - retries
+# activation with vgchange -ay (idempotent and harmless for volumes that
+# are already active). Results are emailed.
+
+- name: Handle LVM problem
+  block:
+    - name: Collect physical volume state
+      ansible.builtin.shell: pvs 2>&1
+      register: pvs_output
+      changed_when: false
+      failed_when: false
+
+    - name: Collect volume group state
+      ansible.builtin.shell: vgs 2>&1
+      register: vgs_output
+      changed_when: false
+      failed_when: false
+
+    - name: Collect logical volume state
+      ansible.builtin.shell: lvs -a 2>&1
+      register: lvs_output
+      changed_when: false
+      failed_when: false
+
+    - name: Collect logical volume activation state
+      ansible.builtin.shell: lvscan 2>&1
+      register: lvscan_output
+      changed_when: false
+      failed_when: false
+
+    - name: Look for missing or unknown physical volumes
+      ansible.builtin.shell: pvs --noheadings 2>&1 | grep -iE 'unknown|missing|not found' || true
+      register: missing_pvs
+      changed_when: false
+
+    - name: Look for inactive logical volumes
+      ansible.builtin.shell: lvscan 2>/dev/null | grep -i inactive || true
+      register: inactive_lvs
+      changed_when: false
+
+    # vgchange -ay only (re)activates - it does not touch data and is a no-op
+    # for volumes that are already active. Only attempted when the alert was
+    # about a failed activation.
+    - name: Retry activating all volume groups
+      ansible.builtin.shell: vgchange -ay 2>&1
+      register: activation_attempt
+      changed_when: true
+      failed_when: false
+      when: "'failed to activate' in message | default('') | lower"
+
+    - name: Re-check activation state after the retry
+      ansible.builtin.shell: lvscan 2>&1
+      register: lvscan_after
+      changed_when: false
+      failed_when: false
+      when: activation_attempt is not skipped
+
+    - name: Compose the LVM report
+      ansible.builtin.set_fact:
+        lvm_report_body: |-
+          Reaqt detected an LVM problem on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          Missing / unknown physical volumes:
+          {{ missing_pvs.stdout | default('') | trim | default('- none found', true) }}
+
+          Inactive logical volumes:
+          {{ inactive_lvs.stdout | default('') | trim | default('- none, all logical volumes are active', true) }}
+
+          {% if activation_attempt is not skipped %}
+          The alert was about a failed activation, so 'vgchange -ay' was retried:
+          {{ activation_attempt.stdout | default('') }}
+
+          --- lvscan (after activation retry) ---
+          {{ lvscan_after.stdout | default('') }}
+          {% endif %}
+
+          --- pvs ---
+          {{ pvs_output.stdout | default('') }}
+
+          --- vgs ---
+          {{ vgs_output.stdout | default('') }}
+
+          --- lvs -a ---
+          {{ lvs_output.stdout | default('') }}
+
+          --- lvscan ---
+          {{ lvscan_output.stdout | default('') }}
+
+    - name: Send the LVM report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] LVM problem on {{ inventory_hostname }}"
+        body: "{{ lvm_report_body }}"
+      become: false

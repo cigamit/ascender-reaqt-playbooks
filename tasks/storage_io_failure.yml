@@ -1,0 +1,178 @@
+---
+# Diagnostics for disk / storage I/O failures.
+#
+# Tries to parse the failing device out of the Reaqt message, works out
+# whether it is local or SAN-attached (SAN devices are reported but never
+# probed), checks filesystems for read-only remounts, collects multipath
+# state if present, and reads SMART health for local disks. The SMART query
+# is passive (-H/-i/-A read the drive's own counters over the command
+# interface) - no self-test is ever started, so a failing disk is not
+# exercised any further.
+
+- name: Handle storage I/O failure
+  vars:
+    san_transports:
+      - iscsi
+      - fc
+      - fcoe
+  block:
+    # --- identify the failing device -----------------------------------
+    - name: Parse the failing device from the Reaqt message
+      ansible.builtin.set_fact:
+        failing_device: >-
+          {{ (message | default('') | regex_search('\b((?:sd|vd|hd)[a-z]+\d*|nvme\d+n\d+(?:p\d+)?|mmcblk\d+(?:p\d+)?|dm-\d+)\b', '\1') or ['']) | first }}
+
+    - name: Work out the base device (strip any partition number)
+      ansible.builtin.set_fact:
+        base_device: >-
+          {{ failing_device if failing_device.startswith('dm-')
+             else failing_device | regex_replace('p\d+$', '') if failing_device.startswith('nvme') or failing_device.startswith('mmcblk')
+             else failing_device | regex_replace('\d+$', '') }}
+
+    - name: Show what was parsed from the message
+      ansible.builtin.debug:
+        msg: >-
+          {{ "Failing device parsed from message: " ~ failing_device ~ " (base device: " ~ base_device ~ ")"
+             if failing_device | length > 0
+             else "Could not identify a device from the message" }}
+
+    - name: Look up the device transport
+      ansible.builtin.command:
+        cmd: lsblk -dno TRAN /dev/{{ base_device }}
+      register: device_tran
+      changed_when: false
+      failed_when: false
+      when: base_device | length > 0
+
+    - name: Record device presence and transport
+      ansible.builtin.set_fact:
+        device_present: "{{ device_tran is not skipped and device_tran.rc == 0 }}"
+        device_transport: "{{ device_tran.stdout | default('') | trim | default('unknown', true) }}"
+
+    - name: Decide whether the device is SAN-attached
+      ansible.builtin.set_fact:
+        device_is_san: "{{ device_transport in san_transports }}"
+
+    # --- filesystem checks -----------------------------------------------
+    - name: Check for filesystems remounted read-only
+      ansible.builtin.shell: >-
+        awk '$1 ~ /^\/dev\// && $4 ~ /(^|,)ro(,|$)/ {print "- "$1" on "$2" ("$4")"}' /proc/mounts
+      register: ro_mounts
+      changed_when: false
+
+    - name: Collect local filesystem usage
+      ansible.builtin.shell: timeout 15 df -hl
+      register: df_output
+      changed_when: false
+      failed_when: false
+
+    - name: Collect the block device layout
+      ansible.builtin.command:
+        cmd: lsblk -o NAME,TYPE,TRAN,SIZE,MODEL,STATE
+      register: lsblk_output
+      changed_when: false
+      failed_when: false
+
+    # --- multipath --------------------------------------------------------
+    - name: Check whether multipath is installed
+      ansible.builtin.shell: command -v multipath
+      register: multipath_check
+      changed_when: false
+      failed_when: false
+
+    - name: Collect multipath status
+      ansible.builtin.command:
+        cmd: multipath -ll
+      register: multipath_output
+      changed_when: false
+      failed_when: false
+      when: multipath_check.rc == 0
+
+    # --- SMART (local disks only, passive read) ---------------------------
+    - name: Check whether smartctl is installed
+      ansible.builtin.shell: command -v smartctl
+      register: smartctl_check
+      changed_when: false
+      failed_when: false
+
+    - name: Read SMART health and attributes (no self-test)
+      ansible.builtin.command:
+        cmd: smartctl -H -i -A /dev/{{ base_device }}
+      register: smart_output
+      changed_when: false
+      failed_when: false
+      when:
+        - base_device | length > 0
+        - device_present | bool
+        - not device_is_san | bool
+        - smartctl_check.rc == 0
+
+    # --- recent kernel errors ---------------------------------------------
+    - name: Collect recent kernel I/O errors
+      ansible.builtin.shell: >-
+        dmesg -T | grep -iE 'i/o error|blk_update_request|buffer i/o|sense key|resetting link|device offline|not ready|rejecting i/o|failed command' | tail -n 30
+      register: dmesg_errors
+      changed_when: false
+      failed_when: false
+
+    # --- report ------------------------------------------------------------
+    - name: Compose the storage failure report
+      ansible.builtin.set_fact:
+        storage_report_body: |-
+          Reaqt detected storage I/O errors on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          Failing device:
+          {% if failing_device | length == 0 %}
+          - Could not parse a device name out of the message.
+          {% else %}
+          - Parsed from message: {{ failing_device }} (base device: {{ base_device }})
+          {% if not device_present | bool %}
+          - /dev/{{ base_device }} is NOT present on the system - the device may have dropped offline entirely.
+          {% elif device_is_san | bool %}
+          - Transport: {{ device_transport }} - this looks SAN-attached, so it was NOT probed. Investigate from the storage side.
+          {% else %}
+          - Transport: {{ device_transport }} - this looks like a local device.
+          {% endif %}
+          {% endif %}
+
+          Filesystems remounted read-only (classic symptom of I/O errors):
+          {{ ro_mounts.stdout if ro_mounts.stdout | length > 0 else '- none found' }}
+
+          --- Local filesystem usage (df -hl) ---
+          {{ df_output.stdout | default('') }}
+
+          --- Block devices (lsblk) ---
+          {{ lsblk_output.stdout | default('') }}
+
+          --- multipath -ll ---
+          {% if multipath_output is defined and multipath_output is not skipped %}
+          {{ multipath_output.stdout | default('') | trim | default('no multipath devices configured', true) }}
+          {% else %}
+          multipath is not installed on this host
+          {% endif %}
+
+          --- SMART health (passive read, no self-test) ---
+          {% if smart_output is defined and smart_output is not skipped %}
+          {{ smart_output.stdout | default('') }}
+          {% elif device_is_san | bool %}
+          Skipped: device is SAN-attached.
+          {% elif failing_device | length == 0 %}
+          Skipped: no device could be identified from the message.
+          {% elif not device_present | bool %}
+          Skipped: the device is no longer present on the system.
+          {% else %}
+          Skipped: smartctl is not installed (install smartmontools to include this).
+          {% endif %}
+
+          --- Recent kernel I/O errors (dmesg) ---
+          {{ dmesg_errors.stdout | default('') | trim | default('none found in the kernel ring buffer', true) }}
+
+    - name: Send the storage failure report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] Storage I/O errors on {{ inventory_hostname }}{{
+          ' - ' ~ base_device if failing_device | length > 0 else '' }}
+        body: "{{ storage_report_body }}"
+      become: false

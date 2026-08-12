@@ -1,0 +1,94 @@
+---
+# Diagnostics and remediation for memory exhaustion / OOM-killer events.
+#
+# Tries to identify the process the OOM killer terminated, collects overall
+# memory usage and the top memory consumers, restarts any "safe" services
+# from safe_restart_services that exist on the host, and emails a report.
+
+- name: Handle memory exhaustion
+  vars:
+    # Services that are safe to bounce after an OOM event. Override with an
+    # extra var to tune per environment.
+    safe_restart_services:
+      - httpd
+      - nginx
+      - php-fpm
+  block:
+    - name: Parse the OOM-killed process from the Reaqt message
+      ansible.builtin.set_fact:
+        oom_killed_info: >-
+          {{ message | default('') | regex_search('(?i)killed process (\d+) \(([^)]+)\)', '\1', '\2') or [] }}
+
+    - name: Record the killed PID and process name
+      ansible.builtin.set_fact:
+        killed_pid: "{{ oom_killed_info[0] | default('') }}"
+        killed_process: "{{ oom_killed_info[1] | default('') }}"
+
+    - name: Show what was parsed from the message
+      ansible.builtin.debug:
+        msg: >-
+          {{ "OOM-killed process: " ~ killed_process ~ " (PID " ~ killed_pid ~ ")"
+             if killed_pid | length > 0
+             else "Could not identify a killed process from the message" }}
+
+    - name: Collect overall memory usage
+      ansible.builtin.command:
+        cmd: free -h
+      register: memory_overview
+      changed_when: false
+
+    - name: Collect the top 10 memory consumers
+      ansible.builtin.shell: ps aux --sort=-%mem | head -n 11
+      register: top_mem_consumers
+      changed_when: false
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Restart safe services that are running or failed
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ safe_restart_services }}"
+      register: service_restarts
+      ignore_errors: true
+      when:
+        - (item ~ '.service') in ansible_facts.services
+        - ansible_facts.services[item ~ '.service'].state in ['running', 'failed']
+
+    - name: Compose the memory exhaustion report
+      ansible.builtin.set_fact:
+        memory_report_body: |-
+          Reaqt detected memory exhaustion on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          {% if killed_pid | length > 0 %}
+          OOM-killed process: {{ killed_process }} (PID {{ killed_pid }})
+          {% else %}
+          The killed process could not be identified from the message.
+          {% endif %}
+
+          --- Memory usage (free -h) ---
+          {{ memory_overview.stdout | default('') }}
+
+          --- Top 10 memory consumers (ps aux --sort=-%mem) ---
+          {{ top_mem_consumers.stdout | default('') }}
+
+          Safe service restarts:
+          {% set restarts = service_restarts.results | default([]) | selectattr('skipped', 'undefined') | list %}
+          {% if restarts | length == 0 %}
+          - None of the configured safe services ({{ safe_restart_services | join(', ') }}) were running or failed on this host, so nothing was restarted.
+          {% else %}
+          {% for r in restarts %}
+          - {{ r.item }}: {{ 'restart FAILED - ' ~ r.msg | default('') if r.failed | default(false) else 'restarted' }}
+          {% endfor %}
+          {% endif %}
+
+    - name: Send the memory exhaustion report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] Memory exhaustion on {{ inventory_hostname }}{{
+          ' - killed ' ~ killed_process if killed_pid | length > 0 else '' }}
+        body: "{{ memory_report_body }}"
+      become: false

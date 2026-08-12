@@ -1,0 +1,134 @@
+---
+# Diagnostics for kernel issues (Oops, panic traces, GPFs).
+#
+# Pure evidence collection - there is no safe automatic remediation for a
+# kernel problem. Note that if the kernel actually panicked, this job never
+# gets to run at all: the host is unreachable and the Ascender job failure
+# is itself the signal. This task covers the survivable cases (an Oops or
+# GPF usually kills one process and taints the kernel, but the system keeps
+# running) and grabs the evidence while the host still responds.
+
+- name: Collect kernel issue diagnostics
+  block:
+    - name: Collect kernel version
+      ansible.builtin.command:
+        cmd: uname -a
+      register: uname_output
+      changed_when: false
+
+    - name: Collect uptime and load
+      ansible.builtin.command:
+        cmd: uptime
+      register: uptime_output
+      changed_when: false
+
+    - name: Read the kernel taint flags
+      ansible.builtin.command:
+        cmd: cat /proc/sys/kernel/tainted
+      register: taint_output
+      changed_when: false
+      failed_when: false
+
+    - name: Check for captured crash dumps
+      ansible.builtin.shell: ls -lt /var/crash 2>/dev/null | head -n 10
+      register: crash_dumps
+      changed_when: false
+      failed_when: false
+
+    - name: Collect serious kernel messages (emerg/alert/crit/err)
+      ansible.builtin.shell: dmesg -T -l emerg,alert,crit,err | tail -n 50
+      register: dmesg_errors
+      changed_when: false
+      failed_when: false
+
+    - name: Collect the tail of the kernel ring buffer
+      ansible.builtin.shell: dmesg -T | tail -n 200
+      register: dmesg_tail
+      changed_when: false
+      failed_when: false
+
+    - name: Collect recent kernel journal entries
+      ansible.builtin.command:
+        cmd: journalctl -k -n 200 --no-pager
+      register: journal_kernel
+      changed_when: false
+      failed_when: false
+
+    - name: Collect vmstat over 5 seconds
+      ansible.builtin.command:
+        cmd: vmstat 1 5
+      register: vmstat_output
+      changed_when: false
+      failed_when: false
+
+    - name: Collect the top CPU consumers
+      ansible.builtin.shell: ps aux --sort=-%cpu | head -n 16
+      register: ps_cpu
+      changed_when: false
+
+    - name: Collect the top memory consumers
+      ansible.builtin.shell: ps aux --sort=-%mem | head -n 16
+      register: ps_mem
+      changed_when: false
+
+    - name: Read /proc/meminfo
+      ansible.builtin.command:
+        cmd: cat /proc/meminfo
+      register: meminfo_output
+      changed_when: false
+
+    - name: Read /proc/loadavg
+      ansible.builtin.command:
+        cmd: cat /proc/loadavg
+      register: loadavg_output
+      changed_when: false
+
+    - name: Compose the kernel issue report
+      ansible.builtin.set_fact:
+        kernel_report_body: |-
+          Reaqt detected a kernel issue on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          The host was reachable and responded to this job, so the kernel survived
+          whatever happened (a panic would have left the host unreachable).
+
+          Kernel: {{ uname_output.stdout | default('') }}
+          Uptime: {{ uptime_output.stdout | default('') | trim }}
+          (A very short uptime here can mean the host rebooted or was reset after a panic.)
+
+          Kernel taint value: {{ taint_output.stdout | default('unknown') | trim }}
+          (0 = never tainted since boot. A non-zero value after an Oops/GPF is expected -
+          the kernel marks itself tainted and the flag persists until reboot.)
+
+          Captured crash dumps in /var/crash:
+          {{ crash_dumps.stdout | default('') | trim | default('- none (or kdump is not configured)', true) }}
+
+          Load: {{ loadavg_output.stdout | default('') | trim }}
+
+          --- Serious kernel messages (dmesg, err and above) ---
+          {{ dmesg_errors.stdout | default('') | trim | default('none', true) }}
+
+          --- vmstat 1 5 ---
+          {{ vmstat_output.stdout | default('') }}
+
+          --- Top 15 CPU consumers ---
+          {{ ps_cpu.stdout | default('') }}
+
+          --- Top 15 memory consumers ---
+          {{ ps_mem.stdout | default('') }}
+
+          --- /proc/meminfo ---
+          {{ meminfo_output.stdout | default('') }}
+
+          --- Kernel ring buffer (last 200 lines) ---
+          {{ dmesg_tail.stdout | default('') }}
+
+          --- Kernel journal (last 200 lines) ---
+          {{ journal_kernel.stdout | default('') }}
+
+    - name: Send the kernel issue report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] Kernel issue on {{ inventory_hostname }}"
+        body: "{{ kernel_report_body }}"
+      become: false

@@ -1,0 +1,67 @@
+---
+# Diagnostics for a failed systemd service.
+#
+# Parses the unit name out of the Reaqt message, captures systemctl status
+# and recent journal output for that unit, and emails the results.
+
+- name: Collect details on the failed systemd service
+  vars:
+    journal_lines: 100
+  block:
+    - name: Parse the service name from the Reaqt message
+      ansible.builtin.set_fact:
+        failed_service: >-
+          {{ (message | default('') | regex_search('([\w@.:-]+)\.service', '\1') or ['']) | first }}
+
+    - name: Show the parsed service name
+      ansible.builtin.debug:
+        msg: "Failed service parsed from message: '{{ failed_service }}.service'"
+      when: failed_service | length > 0
+
+    - name: Get the service status
+      ansible.builtin.command:
+        cmd: systemctl status {{ failed_service }}.service --no-pager -l
+      register: service_status
+      changed_when: false
+      failed_when: false
+      when: failed_service | length > 0
+
+    - name: Get recent journal entries for the service
+      ansible.builtin.command:
+        cmd: journalctl -u {{ failed_service }}.service -n {{ journal_lines }} --no-pager
+      register: service_journal
+      changed_when: false
+      failed_when: false
+      when: failed_service | length > 0
+
+    - name: Compose the diagnostic report
+      ansible.builtin.set_fact:
+        service_report_body: |-
+          Reaqt detected a failed systemd service on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          {% if failed_service | length == 0 %}
+          A service name could not be parsed out of the message, so no diagnostics were collected.
+          {% else %}
+          Service: {{ failed_service }}.service
+
+          --- systemctl status {{ failed_service }}.service ---
+          {{ service_status.stdout | default('') }}
+          {{ service_status.stderr | default('') }}
+
+          --- journalctl -u {{ failed_service }}.service (last {{ journal_lines }} lines) ---
+          {{ service_journal.stdout | default('') }}
+          {{ service_journal.stderr | default('') }}
+          {% endif %}
+
+    - name: Send the diagnostics email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] Service failure on {{ inventory_hostname }}: {{ failed_service if failed_service | length > 0 else 'unknown service' }}"
+        body: "{{ service_report_body }}"
+      become: false
+
+    - name: Fail the job when no service name could be parsed
+      ansible.builtin.fail:
+        msg: "Could not parse a service name out of the Reaqt message: {{ message | default('') }}"
+      when: failed_service | length == 0

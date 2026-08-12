@@ -1,0 +1,154 @@
+---
+# Diagnostics for PID / process exhaustion.
+#
+# Works out which limit is actually being hit (kernel pid_max, a per-user
+# nproc limit, or a cgroup pids limit / systemd TasksMax - the usual suspect
+# on modern systems), and who is consuming the PIDs (by command, by user,
+# and by parent - a single parent with a huge brood is a fork bomb, many
+# same-named siblings is a leaking worker pool). Report only; killing
+# process trees automatically is not safe.
+#
+# Caveat: if the host genuinely cannot fork at all, this job itself may fail
+# to run - a connection/execution failure on this job is part of the signal.
+
+- name: Handle PID / process exhaustion
+  block:
+    # --- current usage vs limits ----------------------------------------
+    - name: Count processes and threads
+      ansible.builtin.shell: echo "$(ps -e --no-headers | wc -l) $(ps -eL --no-headers | wc -l)"
+      register: proc_thread_counts
+      changed_when: false
+
+    - name: Record process and thread counts
+      ansible.builtin.set_fact:
+        total_procs: "{{ fields[0] | default('0') }}"
+        total_threads: "{{ fields[1] | default('0') }}"
+      vars:
+        fields: "{{ (proc_thread_counts.stdout | default('')).split() }}"
+
+    - name: Read kernel.pid_max
+      ansible.builtin.command:
+        cmd: sysctl -n kernel.pid_max
+      register: pid_max
+      changed_when: false
+      failed_when: false
+
+    - name: Read kernel.threads-max
+      ansible.builtin.command:
+        cmd: sysctl -n kernel.threads-max
+      register: threads_max
+      changed_when: false
+      failed_when: false
+
+    - name: Read the systemd default TasksMax
+      ansible.builtin.command:
+        cmd: systemctl show -p DefaultTasksMax --no-pager
+      register: default_tasks_max
+      changed_when: false
+      failed_when: false
+
+    # --- who is consuming the PIDs ------------------------------------------
+    - name: Count processes per command
+      ansible.builtin.shell: ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 15
+      register: procs_by_command
+      changed_when: false
+
+    - name: Count processes per user
+      ansible.builtin.shell: ps -eo user= | sort | uniq -c | sort -rn | head -n 10
+      register: procs_by_user
+      changed_when: false
+
+    - name: Find the parents with the most children
+      ansible.builtin.shell: |
+        ps -eo ppid= | sort | uniq -c | sort -rn | head -n 5 | while read n ppid; do
+          echo "$n children <- PPID $ppid ($(ps -p $ppid -o comm= 2>/dev/null | tr -d ' '))"
+        done
+      register: top_parents
+      changed_when: false
+
+    - name: Record the user with the most processes
+      ansible.builtin.set_fact:
+        top_user_count: "{{ fields[0] | default('0') }}"
+        top_user: "{{ fields[1] if fields | length >= 2 else '' }}"
+      vars:
+        fields: "{{ (procs_by_user.stdout_lines | first | default('')).split() }}"
+
+    - name: Read the top user's process limit (RLIMIT_NPROC)
+      ansible.builtin.shell: >-
+        awk '/Max processes/ {print $3}'
+        /proc/$(ps -u {{ top_user }} -o pid= | head -n 1 | tr -d ' ')/limits
+      register: top_user_nproc
+      changed_when: false
+      failed_when: false
+      when: top_user | length > 0
+
+    # --- cgroup pids limits (TasksMax / container limits) ---------------------
+    - name: Find cgroups close to their pids limit
+      ansible.builtin.shell: |
+        find /sys/fs/cgroup -name pids.current 2>/dev/null | while read f; do
+          c=$(cat "$f" 2>/dev/null || echo 0)
+          m=$(cat "${f%current}max" 2>/dev/null || echo max)
+          if [ "$m" != "max" ] && [ "$c" -gt 0 ]; then
+            pct=$((c * 100 / m))
+            [ "$pct" -ge 80 ] && echo "$c of $m ($pct%) ${f%/pids.current}"
+          fi
+        done | sort -rn | head -n 10
+      register: cgroups_near_limit
+      changed_when: false
+      failed_when: false
+
+    - name: List the cgroups with the most PIDs
+      ansible.builtin.shell: |
+        find /sys/fs/cgroup -name pids.current 2>/dev/null | while read f; do
+          c=$(cat "$f" 2>/dev/null || echo 0)
+          [ "$c" -gt 25 ] && echo "$c ${f%/pids.current}"
+        done | sort -rn | head -n 10
+      register: cgroups_by_pids
+      changed_when: false
+      failed_when: false
+
+    # --- report ---------------------------------------------------------------
+    - name: Compose the PID exhaustion report
+      ansible.builtin.set_fact:
+        pid_report_body: |-
+          Reaqt detected PID / process exhaustion on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          System-wide usage (pid_max counts threads, not just processes):
+          - Processes: {{ total_procs }}, threads: {{ total_threads }}
+          - kernel.pid_max: {{ pid_max.stdout | default('?') | trim }}, kernel.threads-max: {{ threads_max.stdout | default('?') | trim }}
+          {% if pid_max.stdout | default('0') | trim | int > 0 and (total_threads | int * 100 / pid_max.stdout | trim | int) >= 80 %}
+          - The host is at {{ (total_threads | int * 100 / pid_max.stdout | trim | int) | round(1) }}% of kernel.pid_max - genuinely system-wide exhaustion.
+          {% else %}
+          - System-wide usage is well under kernel.pid_max, so the limit being hit is more
+            likely a per-user nproc limit or a cgroup pids limit (TasksMax / container) - see below.
+          {% endif %}
+
+          Cgroups at 80%+ of their pids limit (too-low TasksMax / container PID limits show up here):
+          {{ cgroups_near_limit.stdout | default('') | trim | default('- none', true) }}
+
+          Top user: {{ top_user }} with {{ top_user_count }} processes (their RLIMIT_NPROC: {{ top_user_nproc.stdout | default('?') | trim | default('?', true) }})
+
+          Parents with the most children (one parent with a huge brood = fork bomb;
+          many same-named siblings under init/systemd = leaking worker pool):
+          {{ top_parents.stdout | default('') }}
+
+          Processes per command (top 15):
+          {{ procs_by_command.stdout | default('') }}
+
+          Processes per user (top 10):
+          {{ procs_by_user.stdout | default('') }}
+
+          Cgroups with the most PIDs:
+          {{ cgroups_by_pids.stdout | default('') | trim | default('- none over 25 PIDs', true) }}
+
+          No automatic remediation was attempted - killing process trees or raising
+          limits blindly is not safe. If a fork bomb is confirmed above, kill the
+          parent PID first, then its children.
+
+    - name: Send the PID exhaustion report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] PID/process exhaustion on {{ inventory_hostname }}"
+        body: "{{ pid_report_body }}"
+      become: false

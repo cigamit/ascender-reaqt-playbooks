@@ -1,0 +1,91 @@
+---
+# Report for authentication / SSH failures.
+#
+# This is intentionally report-only: it forwards the triggering message and
+# adds cheap context (who/where parsed from the message, the account's lock
+# state, recent failed logins and their top sources). No accounts are locked
+# or unlocked and no firewall changes are made.
+
+- name: Report authentication failures
+  block:
+    - name: Parse the user and source from the Reaqt message
+      ansible.builtin.set_fact:
+        auth_user: >-
+          {{ (message | default('') | regex_search('(?i)(?:for|user)[ =](?:invalid user )?([a-z0-9._-]+)', '\1') or ['']) | first }}
+        auth_source: >-
+          {{ (message | default('') | regex_search('(?i)from ([0-9a-f:.]+)', '\1') or ['']) | first }}
+
+    - name: Check the account's status
+      ansible.builtin.command:
+        cmd: passwd -S {{ auth_user }}
+      register: account_status
+      changed_when: false
+      failed_when: false
+      when: auth_user | length > 0
+
+    - name: Check the account's faillock state
+      ansible.builtin.command:
+        cmd: faillock --user {{ auth_user }}
+      register: faillock_status
+      changed_when: false
+      failed_when: false
+      when: auth_user | length > 0
+
+    - name: Collect recent failed logins
+      ansible.builtin.shell: lastb -n 20 2>/dev/null
+      register: recent_failures
+      changed_when: false
+      failed_when: false
+
+    - name: Summarise failure sources
+      ansible.builtin.shell: lastb 2>/dev/null | awk 'NF > 3 {print $3}' | sort | uniq -c | sort -rn | head -n 10
+      register: failure_sources
+      changed_when: false
+      failed_when: false
+
+    - name: Collect current logins
+      ansible.builtin.command:
+        cmd: w
+      register: current_logins
+      changed_when: false
+      failed_when: false
+
+    - name: Compose the authentication failure report
+      ansible.builtin.set_fact:
+        auth_report_body: |-
+          Reaqt detected authentication failures on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          This rule fires in burst mode, so this alert means several matching events
+          arrived within a short window - not a single stray typo.
+
+          Parsed from the message:
+          - User: {{ auth_user | default('', true) | default('could not be parsed', true) }}
+          - Source: {{ auth_source | default('', true) | default('could not be parsed', true) }}
+
+          {% if auth_user | length > 0 %}
+          Account status (passwd -S): {{ account_status.stdout | default('') | trim | default('unknown - the user may not exist locally', true) }}
+          Faillock state:
+          {{ faillock_status.stdout | default('') | trim | default('faillock not available or no records', true) }}
+          {% endif %}
+
+          Top failed login sources (from btmp):
+          {{ failure_sources.stdout | default('') | trim | default('- none recorded', true) }}
+
+          Recent failed logins (lastb -n 20):
+          {{ recent_failures.stdout | default('') | trim | default('- none recorded', true) }}
+
+          Currently logged in (w):
+          {{ current_logins.stdout | default('') }}
+
+          No action was taken on the account or firewall - review and respond manually.
+
+    - name: Send the authentication failure report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] Authentication failures on {{ inventory_hostname }}{{
+          ' - user ' ~ auth_user if auth_user | length > 0 else '' }}{{
+          ' from ' ~ auth_source if auth_source | length > 0 else '' }}
+        body: "{{ auth_report_body }}"
+      become: false

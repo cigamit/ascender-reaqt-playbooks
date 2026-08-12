@@ -1,0 +1,185 @@
+---
+# Diagnostics and remediation for CPU / resource exhaustion events
+# (soft/hard lockups, hung tasks, runaway processes).
+#
+# Collects ps/top/vmstat/sar snapshots, identifies the top CPU consumer and
+# whether it looks like a runaway process, checks if the load is actually
+# I/O wait, looks for fork-bomb style process explosions, restarts the
+# runaway service if it is on the safe list, and emails a report.
+
+- name: Handle CPU / resource exhaustion
+  vars:
+    # Top CPU consumer above this %CPU is treated as a runaway process.
+    runaway_cpu_threshold: 90
+    # More instances of a single command than this suggests a fork bomb
+    # or runaway worker pool.
+    proc_count_threshold: 100
+    # I/O wait above this % means the load is I/O-bound, not CPU-bound.
+    iowait_threshold: 30
+    # Services that are safe to bounce if they are the runaway process.
+    safe_restart_services:
+      - httpd
+      - nginx
+      - php-fpm
+  block:
+    # --- collect diagnostics ---------------------------------------------
+    - name: Collect load averages
+      ansible.builtin.command:
+        cmd: uptime
+      register: uptime_output
+      changed_when: false
+
+    - name: Collect the top 10 CPU consumers
+      ansible.builtin.shell: ps aux --sort=-%cpu | head -n 11
+      register: top_cpu_consumers
+      changed_when: false
+
+    - name: Collect a top snapshot
+      ansible.builtin.shell: top -b -n 1 | head -n 25
+      register: top_snapshot
+      changed_when: false
+
+    - name: Collect vmstat over 5 seconds
+      ansible.builtin.command:
+        cmd: vmstat 1 5
+      register: vmstat_output
+      changed_when: false
+
+    - name: Collect sar CPU stats over 5 seconds
+      ansible.builtin.command:
+        cmd: sar -u 1 5
+      register: sar_output
+      changed_when: false
+      failed_when: false
+
+    - name: Count total processes
+      ansible.builtin.shell: ps -e --no-headers | wc -l
+      register: total_procs
+      changed_when: false
+
+    - name: Count processes per command
+      ansible.builtin.shell: ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 5
+      register: proc_counts
+      changed_when: false
+
+    # --- identify runaway process ------------------------------------------
+    - name: Identify the top CPU process
+      ansible.builtin.shell: ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | head -n 1
+      register: top_cpu_proc
+      changed_when: false
+
+    - name: Record the top CPU consumer details
+      ansible.builtin.set_fact:
+        runaway_pid: "{{ fields[0] if fields | length >= 3 else '' }}"
+        runaway_cpu: "{{ fields[1] if fields | length >= 3 else '0' }}"
+        runaway_comm: "{{ fields[2] if fields | length >= 3 else '' }}"
+      vars:
+        fields: "{{ top_cpu_proc.stdout.split() }}"
+
+    - name: Decide whether the top consumer is a runaway process
+      ansible.builtin.set_fact:
+        runaway_detected: "{{ runaway_cpu | float >= runaway_cpu_threshold | float }}"
+
+    - name: Work out which systemd unit owns the runaway process
+      ansible.builtin.command:
+        cmd: systemctl status {{ runaway_pid }} --no-pager
+      register: runaway_unit_status
+      changed_when: false
+      failed_when: false
+      when: runaway_detected | bool
+
+    - name: Record the owning unit
+      ansible.builtin.set_fact:
+        runaway_unit: >-
+          {{ runaway_unit_status.stdout | default('') | regex_search('([\w@.:-]+)\.service') or '' }}
+
+    # --- work out I/O wait vs CPU ---------------------------------------
+    - name: Work out I/O wait from the vmstat sample
+      ansible.builtin.set_fact:
+        iowait_pct: "{{ last_fields[15] if last_fields | length > 15 else '0' }}"
+      vars:
+        last_fields: "{{ (vmstat_output.stdout_lines | last | default('')).split() }}"
+
+    # --- fork bomb / runaway worker check --------------------------------
+    - name: Record the most common process
+      ansible.builtin.set_fact:
+        top_proc_count: "{{ count_fields | first | default('0') }}"
+        top_proc_name: "{{ (count_fields + ['', ''])[1] }}"
+      vars:
+        count_fields: "{{ (proc_counts.stdout_lines | first | default('')).split() }}"
+
+    # --- remediation -------------------------------------------------------
+    - name: Restart the runaway service if it is on the safe list
+      ansible.builtin.service:
+        name: "{{ runaway_unit }}"
+        state: restarted
+      register: runaway_restart
+      ignore_errors: true
+      when:
+        - runaway_detected | bool
+        - runaway_unit | length > 0
+        - runaway_unit | regex_replace('\.service$', '') in safe_restart_services
+
+    # --- report ----------------------------------------------------------
+    - name: Compose the resource exhaustion report
+      ansible.builtin.set_fact:
+        cpu_report_body: |-
+          Reaqt detected CPU / resource exhaustion on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          Load: {{ uptime_output.stdout | default('') | trim }}
+
+          Top CPU process: {{ runaway_comm }} (PID {{ runaway_pid }}, {{ runaway_cpu }}% CPU)
+          {% if runaway_detected | bool %}
+          - This exceeds the runaway threshold of {{ runaway_cpu_threshold }}%.
+          {% if runaway_unit | length > 0 %}
+          - Owning systemd unit: {{ runaway_unit }}
+          {% if runaway_restart is defined and runaway_restart is not skipped %}
+          - {{ runaway_unit }} is on the safe restart list: {{ 'restarted' if not runaway_restart.failed | default(false) else 'restart FAILED - ' ~ runaway_restart.msg | default('') }}
+          {% else %}
+          - {{ runaway_unit }} is not on the safe restart list, so it was not restarted.
+          {% endif %}
+          {% else %}
+          - No owning systemd unit could be identified, so nothing was restarted.
+          {% endif %}
+          {% else %}
+          - Below the runaway threshold of {{ runaway_cpu_threshold }}%, so this does not look like a single runaway process.
+          {% endif %}
+
+          CPU vs I/O wait:
+          - I/O wait over a 5 second sample: {{ iowait_pct }}%
+          {% if iowait_pct | int >= iowait_threshold | int %}
+          - The load appears to be I/O-bound rather than CPU-bound. Check disks, NFS mounts, and swap activity.
+          {% else %}
+          - The load appears to be CPU-bound rather than I/O-bound.
+          {% endif %}
+
+          Fork bomb / runaway worker check:
+          - Total processes: {{ total_procs.stdout | default('') | trim }}
+          - Most common process: {{ top_proc_name }} ({{ top_proc_count }} instances)
+          {% if top_proc_count | int >= proc_count_threshold | int %}
+          - WARNING: this exceeds {{ proc_count_threshold }} instances and may be a fork bomb or runaway worker pool.
+          {% endif %}
+          Top process counts:
+          {{ proc_counts.stdout | default('') }}
+
+          --- Top 10 CPU consumers (ps aux --sort=-%cpu) ---
+          {{ top_cpu_consumers.stdout | default('') }}
+
+          --- top snapshot ---
+          {{ top_snapshot.stdout | default('') }}
+
+          --- vmstat 1 5 ---
+          {{ vmstat_output.stdout | default('') }}
+
+          --- sar -u 1 5 ---
+          {{ sar_output.stdout if sar_output.rc | default(1) == 0 else 'sar not available (is sysstat installed?)' }}
+
+    - name: Send the resource exhaustion report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] CPU/resource exhaustion on {{ inventory_hostname }}{{
+          ' - runaway ' ~ runaway_comm if runaway_detected | bool else '' }}
+        body: "{{ cpu_report_body }}"
+      become: false

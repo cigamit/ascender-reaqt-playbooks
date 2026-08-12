@@ -1,0 +1,181 @@
+---
+# Diagnostics and remediation for file descriptor exhaustion.
+#
+# Works out whether the problem is system-wide (ENFILE - the kernel file
+# table is full) or per-process (EMFILE - one process hit its own limit),
+# identifies the process involved (from the message when possible, else the
+# top FD consumer), compares its FD count to its limit, restarts the owning
+# service if it is on the safe list, and emails a report.
+
+- name: Handle file descriptor exhaustion
+  vars:
+    # Services that are safe to bounce if they are the FD hog.
+    safe_restart_services:
+      - httpd
+      - nginx
+      - php-fpm
+  block:
+    # --- identify the process ----------------------------------------------
+    - name: Parse the process from the Reaqt message
+      ansible.builtin.set_fact:
+        msg_proc_info: >-
+          {{ message | default('') | regex_search('([\w.-]+)\[(\d+)\]', '\1', '\2') or [] }}
+
+    - name: Record the process hinted at by the message
+      ansible.builtin.set_fact:
+        culprit_name_hint: "{{ msg_proc_info[0] | default('') }}"
+        culprit_pid_hint: "{{ msg_proc_info[1] | default('') }}"
+
+    # --- count open FDs -------------------------------------------------------
+    - name: Read system-wide file descriptor usage
+      ansible.builtin.command:
+        cmd: cat /proc/sys/fs/file-nr
+      register: file_nr
+      changed_when: false
+      failed_when: false
+
+    - name: Record system-wide FD usage
+      ansible.builtin.set_fact:
+        fd_allocated: "{{ fields[0] if fields | length >= 3 else '0' }}"
+        fd_max: "{{ fields[2] if fields | length >= 3 else '1' }}"
+      vars:
+        fields: "{{ (file_nr.stdout | default('')).split() }}"
+
+    - name: Count open FDs per process (top 15)
+      ansible.builtin.shell: |
+        for p in /proc/[0-9]*; do
+          pid=${p#/proc/}
+          n=$(ls "$p/fd" 2>/dev/null | wc -l)
+          [ "$n" -gt 0 ] && echo "$n $pid $(cat $p/comm 2>/dev/null)"
+        done | sort -rn | head -n 15
+      register: fd_top
+      changed_when: false
+
+    - name: Record the top FD consumer
+      ansible.builtin.set_fact:
+        top_fd_count: "{{ fields[0] | default('0') }}"
+        top_fd_pid: "{{ fields[1] if fields | length >= 2 else '' }}"
+        top_fd_comm: "{{ fields[2] if fields | length >= 3 else '' }}"
+      vars:
+        fields: "{{ (fd_top.stdout_lines | first | default('')).split() }}"
+
+    - name: Decide which process to investigate
+      ansible.builtin.set_fact:
+        culprit_pid: "{{ culprit_pid_hint if culprit_pid_hint | length > 0 else top_fd_pid }}"
+        culprit_name: "{{ culprit_name_hint if culprit_pid_hint | length > 0 else top_fd_comm }}"
+
+    # --- check limits ---------------------------------------------------------
+    - name: Count the culprit's open FDs
+      ansible.builtin.shell: ls /proc/{{ culprit_pid }}/fd 2>/dev/null | wc -l
+      register: culprit_fd_count
+      changed_when: false
+      failed_when: false
+      when: culprit_pid | length > 0
+
+    - name: Read the culprit's open files limit
+      ansible.builtin.shell: awk '/Max open files/ {print $5}' /proc/{{ culprit_pid }}/limits
+      register: culprit_fd_limit
+      changed_when: false
+      failed_when: false
+      when: culprit_pid | length > 0
+
+    - name: Read the systemd default FD limit
+      ansible.builtin.command:
+        cmd: systemctl show -p DefaultLimitNOFILE --no-pager
+      register: systemd_fd_limit
+      changed_when: false
+      failed_when: false
+
+    - name: Read the inotify limits
+      ansible.builtin.shell: sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+      register: inotify_limits
+      changed_when: false
+      failed_when: false
+
+    - name: Collect the socket summary
+      ansible.builtin.shell: ss -s
+      register: socket_summary
+      changed_when: false
+      failed_when: false
+
+    # --- remediation ----------------------------------------------------------
+    - name: Work out which systemd unit owns the culprit
+      ansible.builtin.command:
+        cmd: systemctl status {{ culprit_pid }} --no-pager
+      register: culprit_unit_status
+      changed_when: false
+      failed_when: false
+      when: culprit_pid | length > 0
+
+    - name: Record the owning unit
+      ansible.builtin.set_fact:
+        culprit_unit: >-
+          {{ culprit_unit_status.stdout | default('') | regex_search('([\w@.:-]+)\.service') or '' }}
+
+    - name: Restart the culprit service if it is on the safe list
+      ansible.builtin.service:
+        name: "{{ culprit_unit }}"
+        state: restarted
+      register: culprit_restart
+      ignore_errors: true
+      when:
+        - culprit_unit | length > 0
+        - culprit_unit | regex_replace('\.service$', '') in safe_restart_services
+
+    # --- report -----------------------------------------------------------
+    - name: Compose the FD exhaustion report
+      ansible.builtin.set_fact:
+        fd_report_body: |-
+          Reaqt detected file descriptor exhaustion on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          System-wide file descriptors: {{ fd_allocated }} allocated of {{ fd_max }} max ({{ (fd_allocated | int * 100 / fd_max | int) | round(1) }}%)
+          {% if (fd_allocated | int * 100 / fd_max | int) >= 80 %}
+          - The kernel file table is nearly full (ENFILE territory). This affects every
+            process on the host. Raising fs.file-max may be needed on top of fixing the leak.
+          {% else %}
+          - System-wide usage is fine, so this was almost certainly one process hitting
+            its own limit (EMFILE) rather than the whole host running out.
+          {% endif %}
+
+          Process under investigation{{ ' (parsed from the message)' if culprit_pid_hint | length > 0 else ' (top FD consumer on the host)' }}:
+          {% if culprit_pid | length == 0 %}
+          - none could be identified
+          {% else %}
+          - {{ culprit_name }} (PID {{ culprit_pid }})
+          - Open FDs: {{ culprit_fd_count.stdout | default('?') | trim }} of {{ culprit_fd_limit.stdout | default('?') | trim }} allowed
+          {% if culprit_unit | length > 0 %}
+          - Owning systemd unit: {{ culprit_unit }}
+          {% if culprit_restart is defined and culprit_restart is not skipped %}
+          - {{ culprit_unit }} is on the safe restart list: {{ 'restarted (this releases its FDs)' if not culprit_restart.failed | default(false) else 'restart FAILED - ' ~ culprit_restart.msg | default('') }}
+          {% else %}
+          - {{ culprit_unit }} is not on the safe restart list, so it was not restarted.
+          {% endif %}
+          {% else %}
+          - No owning systemd unit could be identified, so nothing was restarted.
+          {% endif %}
+          {% endif %}
+
+          Top 15 FD consumers (count / PID / command):
+          {{ fd_top.stdout | default('') }}
+
+          Limits:
+          - {{ systemd_fd_limit.stdout | default('DefaultLimitNOFILE unknown') | trim }} (systemd default for services)
+          {% for line in inotify_limits.stdout_lines | default([]) %}
+          - {{ line }}
+          {% endfor %}
+          Note: inotify watches can also throw "Too many open files" even when FD counts
+          look healthy - if the numbers above all look fine, suspect inotify (common with
+          file-watching agents and IDE/sync tooling).
+
+          --- Socket summary (ss -s, socket leaks are a common FD leak) ---
+          {{ socket_summary.stdout | default('') }}
+
+    - name: Send the FD exhaustion report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: >-
+          [Reaqt] FD exhaustion on {{ inventory_hostname }}{{
+          ' - ' ~ culprit_name if culprit_name | length > 0 else '' }}
+        body: "{{ fd_report_body }}"
+      become: false

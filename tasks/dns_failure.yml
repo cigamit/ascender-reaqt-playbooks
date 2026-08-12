@@ -1,0 +1,160 @@
+---
+# Diagnostics and remediation for DNS resolution failures.
+#
+# Reads the configured nameservers (from ansible facts / resolv.conf), tests
+# resolution of a configurable list of domains through the system resolver
+# and against each nameserver directly (plus the localhost resolver), checks
+# NetworkManager and local resolver services, restarts the local resolver if
+# resolution is broken, and emails a report. It never restarts NetworkManager
+# or the network connection itself.
+
+- name: Handle DNS resolution failure
+  vars:
+    # Domains to test. Override with an extra var to add internal zones.
+    dns_test_domains:
+      - ciq.com
+      - google.com
+      - microsoft.com
+    # Local resolver/caching services that are safe to bounce if resolution
+    # is broken. NetworkManager is deliberately not in this list.
+    resolver_services:
+      - systemd-resolved
+      - dnsmasq
+      - unbound
+      - nscd
+  block:
+    # --- current configuration -----------------------------------------
+    - name: Record the configured nameservers
+      ansible.builtin.set_fact:
+        dns_nameservers: "{{ ansible_dns.nameservers | default([]) }}"
+
+    - name: Read /etc/resolv.conf
+      ansible.builtin.command:
+        cmd: cat /etc/resolv.conf
+      register: resolv_conf
+      changed_when: false
+      failed_when: false
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Collect DNS configuration from NetworkManager
+      ansible.builtin.shell: nmcli dev show 2>/dev/null | grep -E 'GENERAL.DEVICE|IP4.DNS|IP6.DNS'
+      register: nmcli_dns
+      changed_when: false
+      failed_when: false
+
+    # --- resolution tests -------------------------------------------------
+    - name: Test resolution through the system resolver
+      ansible.builtin.command:
+        cmd: timeout 10 getent hosts {{ item }}
+      loop: "{{ dns_test_domains }}"
+      register: dns_tests
+      changed_when: false
+      failed_when: false
+
+    - name: Work out whether resolution is broken
+      ansible.builtin.set_fact:
+        dns_broken: "{{ dns_tests.results | selectattr('rc', 'ne', 0) | list | length > 0 }}"
+
+    - name: Check whether dig is installed
+      ansible.builtin.shell: command -v dig
+      register: dig_check
+      changed_when: false
+      failed_when: false
+
+    - name: Test each nameserver directly (including the localhost resolver)
+      ansible.builtin.command:
+        cmd: dig +time=3 +tries=1 +short @{{ item.0 }} {{ item.1 }}
+      loop: "{{ ((dns_nameservers + ['127.0.0.1']) | unique) | product(dns_test_domains) | list }}"
+      loop_control:
+        label: "@{{ item.0 }} {{ item.1 }}"
+      register: server_tests
+      changed_when: false
+      failed_when: false
+      when: dig_check.rc == 0
+
+    # --- remediation: restart the local resolver ------------------------
+    - name: Restart local resolver services that are running or failed
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ resolver_services }}"
+      register: resolver_restarts
+      ignore_errors: true
+      when:
+        - dns_broken | bool
+        - (item ~ '.service') in ansible_facts.services
+        - ansible_facts.services[item ~ '.service'].state in ['running', 'failed']
+
+    - name: Work out whether anything was restarted
+      ansible.builtin.set_fact:
+        resolver_restarted: >-
+          {{ resolver_restarts.results | default([]) | selectattr('skipped', 'undefined') | list | length > 0 }}
+
+    - name: Re-test resolution after restarting the resolver
+      ansible.builtin.command:
+        cmd: timeout 10 getent hosts {{ item }}
+      loop: "{{ dns_test_domains }}"
+      register: dns_retests
+      changed_when: false
+      failed_when: false
+      when: resolver_restarted | bool
+
+    # --- report ----------------------------------------------------------
+    - name: Compose the DNS failure report
+      ansible.builtin.set_fact:
+        dns_report_body: |-
+          Reaqt detected a DNS resolution failure on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          Configured nameservers: {{ dns_nameservers | join(', ') if dns_nameservers | length > 0 else 'none found in facts' }}
+
+          System resolver tests (getent hosts):
+          {% for r in dns_tests.results %}
+          - {{ r.item }}: {{ 'OK (' ~ (r.stdout_lines | first | default('')) ~ ')' if r.rc == 0 else 'FAILED' }}
+          {% endfor %}
+
+          Nameserver tests (dig, 3s timeout):
+          {% if server_tests is not skipped %}
+          {% for r in server_tests.results %}
+          - @{{ r.item.0 }} {{ r.item.1 }}: {{ 'OK (' ~ (r.stdout_lines | first | default('no answer')) ~ ')' if r.rc == 0 and r.stdout | length > 0 else 'FAILED' }}{{ ' (normal if no local resolver is running)' if r.item.0 == '127.0.0.1' and (r.rc != 0 or r.stdout | length == 0) and '127.0.0.1' not in dns_nameservers else '' }}
+          {% endfor %}
+          {% else %}
+          - Skipped: dig is not installed (install bind-utils to include this).
+          {% endif %}
+
+          Resolver services:
+          {% for svc in resolver_services %}
+          - {{ svc }}: {{ ansible_facts.services[svc ~ '.service'].state | default('not installed') }}
+          {% endfor %}
+          - NetworkManager: {{ ansible_facts.services['NetworkManager.service'].state | default('not installed') }} (never restarted by this job)
+
+          {% if not dns_broken | bool %}
+          Resolution through the system resolver currently works, so no remediation was attempted.
+          The failure that triggered this alert may have been transient.
+          {% elif resolver_restarted | bool %}
+          Resolution was broken, so the local resolver services above that were running or failed were restarted.
+
+          Resolution after restart:
+          {% for r in dns_retests.results %}
+          - {{ r.item }}: {{ 'OK (' ~ (r.stdout_lines | first | default('')) ~ ')' if r.rc == 0 else 'still FAILED' }}
+          {% endfor %}
+          {% else %}
+          Resolution is broken, but none of the known local resolver services are present and running,
+          so there was nothing safe to restart. The nameservers themselves (or the network path to
+          them) are the likely problem - see the per-nameserver tests above.
+          {% endif %}
+
+          --- /etc/resolv.conf ---
+          {{ resolv_conf.stdout | default('could not read /etc/resolv.conf') }}
+
+          --- NetworkManager DNS configuration ---
+          {{ nmcli_dns.stdout | default('') | trim | default('nmcli not available or no DNS configured', true) }}
+
+    - name: Send the DNS failure report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] DNS resolution failure on {{ inventory_hostname }}"
+        body: "{{ dns_report_body }}"
+      become: false

@@ -1,0 +1,158 @@
+---
+# Diagnostics and remediation for time synchronization problems (chrony).
+#
+# Collects chronyc tracking/sources/activity and timedatectl output, checks
+# which NTP sources are unreachable (and whether they respond to ping at
+# all), restarts chronyd if the clock is genuinely unsynchronised, and
+# emails a report. It never steps the clock itself - chronyd is left to
+# correct the time gradually once it is healthy.
+
+- name: Handle time synchronization failure
+  vars:
+    post_restart_wait_seconds: 10
+  block:
+    # --- current state -----------------------------------------------------
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Collect timedatectl status
+      ansible.builtin.command:
+        cmd: timedatectl status
+      register: timedatectl_output
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether chronyc is installed
+      ansible.builtin.shell: command -v chronyc
+      register: chronyc_check
+      changed_when: false
+      failed_when: false
+
+    - name: Collect chrony tracking state
+      ansible.builtin.command:
+        cmd: chronyc tracking
+      register: chrony_tracking
+      changed_when: false
+      failed_when: false
+      when: chronyc_check.rc == 0
+
+    - name: Collect chrony sources
+      ansible.builtin.command:
+        cmd: chronyc sources
+      register: chrony_sources
+      changed_when: false
+      failed_when: false
+      when: chronyc_check.rc == 0
+
+    - name: Collect chrony source activity
+      ansible.builtin.command:
+        cmd: chronyc activity
+      register: chrony_activity
+      changed_when: false
+      failed_when: false
+      when: chronyc_check.rc == 0
+
+    # --- source reachability ------------------------------------------------
+    - name: List sources chrony cannot reach (reach register = 0)
+      ansible.builtin.shell: chronyc sources | awk '$1 ~ /^[\^=#]/ && $5 == 0 {print $2}'
+      register: unreachable_sources
+      changed_when: false
+      failed_when: false
+      when: chronyc_check.rc == 0
+
+    - name: Ping the unreachable sources to test basic network reachability
+      ansible.builtin.command:
+        cmd: ping -c 1 -W 2 {{ item }}
+      loop: "{{ unreachable_sources.stdout_lines | default([]) }}"
+      register: source_pings
+      changed_when: false
+      failed_when: false
+
+    # --- decide whether sync is actually broken ------------------------------
+    - name: Work out whether the clock is unsynchronised
+      ansible.builtin.set_fact:
+        sync_broken: >-
+          {{ chrony_tracking is skipped
+             or chrony_tracking.rc != 0
+             or 'not synchronised' in chrony_tracking.stdout | lower
+             or 'not synchronized' in chrony_tracking.stdout | lower }}
+
+    # --- remediation ---------------------------------------------------------
+    - name: Restart chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
+      register: chronyd_restart
+      ignore_errors: true
+      when:
+        - sync_broken | bool
+        - "'chronyd.service' in ansible_facts.services"
+        - ansible_facts.services['chronyd.service'].state in ['running', 'failed']
+
+    - name: Give chronyd a moment to reselect a source
+      ansible.builtin.pause:
+        seconds: "{{ post_restart_wait_seconds }}"
+      when: chronyd_restart is not skipped
+
+    - name: Collect chrony tracking state after the restart
+      ansible.builtin.command:
+        cmd: chronyc tracking
+      register: chrony_tracking_after
+      changed_when: false
+      failed_when: false
+      when: chronyd_restart is not skipped
+
+    # --- report --------------------------------------------------------------
+    - name: Compose the time sync report
+      ansible.builtin.set_fact:
+        time_report_body: |-
+          Reaqt detected a time synchronization problem on {{ inventory_hostname }}.
+          Reaqt message: {{ message | default('n/a') }}
+
+          chronyd service: {{ ansible_facts.services['chronyd.service'].state | default('not installed') }}
+
+          {% if chronyc_check.rc != 0 %}
+          chronyc is not available on this host, so no chrony diagnostics could be collected.
+          Check which time service this host actually uses (timedatectl output below).
+          {% else %}
+          Unreachable NTP sources (reach register = 0):
+          {% if unreachable_sources.stdout_lines | default([]) | length == 0 %}
+          - none, all sources are being reached
+          {% else %}
+          {% for r in source_pings.results %}
+          - {{ r.item }}: {{ 'responds to ping - NTP (udp/123) may be blocked or the server is not serving time' if r.rc == 0 else 'does not respond to ping - host or network path is down' }}
+          {% endfor %}
+          {% endif %}
+
+          {% if not sync_broken | bool %}
+          The clock is currently synchronised, so chronyd was not restarted.
+          The event that triggered this alert may have been a transient step or a manual time change.
+          {% elif chronyd_restart is not skipped %}
+          The clock was not synchronised, so chronyd was restarted and given {{ post_restart_wait_seconds }} seconds to reselect a source.
+
+          --- chronyc tracking (after restart) ---
+          {{ chrony_tracking_after.stdout | default('') }}
+          {% else %}
+          The clock is not synchronised, but chronyd is not present or not in a running/failed state,
+          so nothing was restarted. If this host uses a different time service, it needs manual attention.
+          {% endif %}
+
+          --- chronyc tracking (at alert time) ---
+          {{ chrony_tracking.stdout | default('') }}
+
+          --- chronyc sources ---
+          {{ chrony_sources.stdout | default('') }}
+
+          --- chronyc activity ---
+          {{ chrony_activity.stdout | default('') }}
+          {% endif %}
+
+          --- timedatectl ---
+          {{ timedatectl_output.stdout | default('') }}
+
+    - name: Send the time sync report email
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/tools/mail.yml"
+      vars:
+        subject: "[Reaqt] Time sync problem on {{ inventory_hostname }}"
+        body: "{{ time_report_body }}"
+      become: false

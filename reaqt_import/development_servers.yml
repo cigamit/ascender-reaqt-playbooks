@@ -3,6 +3,62 @@
   token: 450b5cb530ca199df6d59ea715bc92416b3ae8362dad3c74f995c48db8594fb9
   rules:
     0:
+      - name: DNS Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Name resolution failing
+            condition:
+              - >-
+                'temporary failure in name resolution' in event.payload.message|lower
+                or 'could not resolve host' in event.payload.message|lower
+                or 'name or service not known' in event.payload.message|lower
+                or 'server misbehaving' in event.payload.message|lower
+                or 'no servers could be reached' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: dns_failure.yml
+    1:
+      - name: Authentication / SSH Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: true
+            count: 5
+            minutes: 1
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Failed logins / locked accounts
+            condition:
+              - >-
+                'failed password' in event.payload.message|lower
+                or 'invalid user' in event.payload.message|lower
+                or 'authentication failure' in event.payload.message|lower
+                or 'failed publickey' in event.payload.message|lower
+                or ('account' in event.payload.message|lower and 'locked' in event.payload.message|lower)
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: auth_failure.yml
+    2:
       - name: Disk Warning
         enabled: true
         triggers:
@@ -30,7 +86,293 @@
               extra_vars:
                 message: "{{ event.payload.message }}"
                 task_file: disk_warning.yml
-    1:
+    3:
+      - name: Service Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Systemd service failed
+            condition:
+              - "'.service' in event.payload.message"
+              - >-
+                'Failed to start' in event.payload.message
+                or 'Main process exited' in event.payload.message
+                or 'Failed with result' in event.payload.message
+                or 'Start request repeated too quickly' in event.payload.message
+                or 'failed because' in event.payload.message
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: service_failure.yml
+    4:
+      - name: Memory Exhaustion
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Out of memory / OOM killer
+            condition:
+              - >-
+                'out of memory' in event.payload.message|lower
+                or 'oom-killer' in event.payload.message|lower
+                or 'killed process' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: memory_exhaustion.yml
+    5:
+      - name: CPU / Resource Exhaustion
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Lockups / hung tasks / stalls
+            condition:
+              - >-
+                'soft lockup' in event.payload.message|lower
+                or 'hard lockup' in event.payload.message|lower
+                or 'hung_task' in event.payload.message|lower
+                or 'blocked for more than' in event.payload.message|lower
+                or 'detected stalls' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: cpu_exhaustion.yml
+    6:
+      - name: Storage I/O Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Disk / storage I/O errors
+            condition:
+              - >-
+                'i/o error' in event.payload.message|lower
+                or 'rejecting i/o' in event.payload.message|lower
+                or 'sense key' in event.payload.message|lower
+                or 'device offline' in event.payload.message|lower
+                or 'device not ready' in event.payload.message|lower
+                or 'resetting link' in event.payload.message|lower
+                or 'scsi error' in event.payload.message|lower
+                or 'failed command' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: storage_io_failure.yml
+    7:
+      - name: Time Sync Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Clock not synchronising
+            condition:
+              - >-
+                'time has been changed' in event.payload.message|lower
+                or 'suitable source' in event.payload.message|lower
+                or 'could not synchron' in event.payload.message|lower
+                or 'system clock wrong' in event.payload.message|lower
+                or ('source' in event.payload.message|lower and 'offline' in event.payload.message|lower)
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: time_sync_failure.yml
+    8:
+      - name: RAID Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Software RAID degraded / rebuilding
+            condition:
+              - >-
+                'md: recovery' in event.payload.message|lower
+                or 'md: resync' in event.payload.message|lower
+                or 'md/raid' in event.payload.message|lower
+                or 'mdadm' in event.payload.message|lower
+                or ('degraded' in event.payload.message|lower
+                    and ('raid' in event.payload.message|lower
+                         or 'array' in event.payload.message|lower
+                         or 'md' in event.payload.message|lower))
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: raid_failure.yml
+    9:
+      - name: LVM Failure
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: LVM activation / missing PV problems
+            condition:
+              - >-
+                'failed to activate' in event.payload.message|lower
+                or ('pv ' in event.payload.message|lower and 'not found' in event.payload.message|lower)
+                or ('volume group' in event.payload.message|lower and 'not found' in event.payload.message|lower)
+                or ('pool' in event.payload.message|lower and '% full' in event.payload.message|lower)
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: lvm_failure.yml
+    10:
+      - name: Kernel Issue
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Kernel oops / panic / GPF
+            condition:
+              - >-
+                'kernel panic' in event.payload.message|lower
+                or 'oops:' in event.payload.message|lower
+                or 'call trace' in event.payload.message|lower
+                or 'general protection fault' in event.payload.message|lower
+                or 'unable to handle' in event.payload.message|lower
+                or 'null pointer dereference' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: kernel_issue.yml
+    11:
+      - name: File Descriptor Exhaustion
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Too many open files
+            condition:
+              - >-
+                'too many open files' in event.payload.message|lower
+                or 'emfile' in event.payload.message|lower
+                or 'enfile' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: fd_exhaustion.yml
+    12:
+      - name: PID / Process Exhaustion
+        enabled: true
+        triggers:
+          throttle:
+            enabled: true
+            minutes: 5
+          burst:
+            enabled: false
+            count: 5
+            minutes: 10
+        provider:
+          name: Ascender Server
+          template: 34
+        rule:
+          - name: Cannot fork / pids limit
+            condition:
+              - >-
+                'resource temporarily unavailable' in event.payload.message|lower
+                or 'cannot fork' in event.payload.message|lower
+                or "can't fork" in event.payload.message|lower
+                or 'fork failed' in event.payload.message|lower
+                or 'fork rejected' in event.payload.message|lower
+                or 'pids cgroup' in event.payload.message|lower
+                or 'pids controller' in event.payload.message|lower
+                or 'tasksmax' in event.payload.message|lower
+            provide:
+              limit: "{{ event.payload.hostname }}"
+              extra_vars:
+                message: "{{ event.payload.message }}"
+                task_file: pid_exhaustion.yml
+    13:
       - name: Log Unknown Errors / Warnings
         enabled: true
         triggers:
