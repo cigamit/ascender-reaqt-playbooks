@@ -47,7 +47,7 @@
       when: "'/boot' in full_mounts"
 
     # --- / and /tmp ------------------------------------------------------------
-    - name: Find files in /tmp older than {{ tmp_max_age_days }} days
+    - name: Find old files in /tmp
       ansible.builtin.find:
         paths: /tmp
         age: "{{ tmp_max_age_days }}d"
@@ -73,7 +73,7 @@
       failed_when: false
       when: full_mounts | intersect(['/', '/var', '/var/log']) | length > 0
 
-    - name: Find log files in /var/log older than {{ log_max_age_days }} days
+    - name: Find old log files in /var/log
       ansible.builtin.find:
         paths: /var/log
         age: "{{ log_max_age_days }}d"
@@ -93,7 +93,7 @@
     # Runs as part of the general / and /var cleanup, but also whenever the
     # alert itself is about journald failing - that can happen before any
     # filesystem crosses the usage threshold.
-    - name: Trim the systemd journal to {{ journal_max_age_days }} days
+    - name: Trim the systemd journal
       ansible.builtin.command:
         cmd: journalctl --vacuum-time={{ journal_max_age_days }}d
       register: journal_vacuum
@@ -109,7 +109,7 @@
       changed_when: true
       when: full_mounts | intersect(['/', '/var']) | length > 0
 
-    - name: Find coredumps older than {{ tmp_max_age_days }} days
+    - name: Find old coredumps
       ansible.builtin.find:
         paths: /var/lib/systemd/coredump
         age: "{{ tmp_max_age_days }}d"
@@ -127,7 +127,8 @@
 
     # --- container runtimes --------------------------------------------------
     - name: Check whether docker is installed
-      ansible.builtin.shell: command -v docker
+      ansible.builtin.command:
+        cmd: which docker
       register: docker_check
       changed_when: false
       failed_when: false
@@ -154,7 +155,8 @@
         - docker_check.rc == 0
 
     - name: Check whether podman is installed
-      ansible.builtin.shell: command -v podman
+      ansible.builtin.command:
+        cmd: which podman
       register: podman_check
       changed_when: false
       failed_when: false

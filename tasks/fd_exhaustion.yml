@@ -43,13 +43,17 @@
 
     - name: Count open FDs per process (top 15)
       ansible.builtin.shell: |
+        set -o pipefail
         for p in /proc/[0-9]*; do
           pid=${p#/proc/}
           n=$(ls "$p/fd" 2>/dev/null | wc -l)
           [ "$n" -gt 0 ] && echo "$n $pid $(cat $p/comm 2>/dev/null)"
         done | sort -rn | head -n 15
+      args:
+        executable: /bin/bash
       register: fd_top
       changed_when: false
+      failed_when: false
 
     - name: Record the top FD consumer
       ansible.builtin.set_fact:
@@ -66,14 +70,19 @@
 
     # --- check limits ---------------------------------------------------------
     - name: Count the culprit's open FDs
-      ansible.builtin.shell: ls /proc/{{ culprit_pid }}/fd 2>/dev/null | wc -l
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls /proc/{{ culprit_pid }}/fd 2>/dev/null | wc -l
+      args:
+        executable: /bin/bash
       register: culprit_fd_count
       changed_when: false
       failed_when: false
       when: culprit_pid | length > 0
 
     - name: Read the culprit's open files limit
-      ansible.builtin.shell: awk '/Max open files/ {print $5}' /proc/{{ culprit_pid }}/limits
+      ansible.builtin.command:
+        cmd: awk '/Max open files/ {print $5}' /proc/{{ culprit_pid }}/limits
       register: culprit_fd_limit
       changed_when: false
       failed_when: false
@@ -87,13 +96,15 @@
       failed_when: false
 
     - name: Read the inotify limits
-      ansible.builtin.shell: sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+      ansible.builtin.command:
+        cmd: sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
       register: inotify_limits
       changed_when: false
       failed_when: false
 
     - name: Collect the socket summary
-      ansible.builtin.shell: ss -s
+      ansible.builtin.command:
+        cmd: ss -s
       register: socket_summary
       changed_when: false
       failed_when: false
@@ -147,7 +158,9 @@
           {% if culprit_unit | length > 0 %}
           - Owning systemd unit: {{ culprit_unit }}
           {% if culprit_restart is defined and culprit_restart is not skipped %}
-          - {{ culprit_unit }} is on the safe restart list: {{ 'restarted (this releases its FDs)' if not culprit_restart.failed | default(false) else 'restart FAILED - ' ~ culprit_restart.msg | default('') }}
+          {% set restart_note = 'restarted (this releases its FDs)' if not culprit_restart.failed | default(false)
+             else 'restart FAILED - ' ~ culprit_restart.msg | default('') %}
+          - {{ culprit_unit }} is on the safe restart list: {{ restart_note }}
           {% else %}
           - {{ culprit_unit }} is not on the safe restart list, so it was not restarted.
           {% endif %}

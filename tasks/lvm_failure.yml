@@ -33,12 +33,20 @@
       failed_when: false
 
     - name: Look for missing or unknown physical volumes
-      ansible.builtin.shell: pvs --noheadings 2>&1 | grep -iE 'unknown|missing|not found' || true
+      ansible.builtin.shell: |
+        set -o pipefail
+        pvs --noheadings 2>&1 | grep -iE 'unknown|missing|not found' || true
+      args:
+        executable: /bin/bash
       register: missing_pvs
       changed_when: false
 
     - name: Look for inactive logical volumes
-      ansible.builtin.shell: lvscan 2>/dev/null | grep -i inactive || true
+      ansible.builtin.shell: |
+        set -o pipefail
+        lvscan 2>/dev/null | grep -i inactive || true
+      args:
+        executable: /bin/bash
       register: inactive_lvs
       changed_when: false
 

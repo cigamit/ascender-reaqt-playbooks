@@ -38,7 +38,11 @@
       failed_when: false
 
     - name: Summarise failure sources
-      ansible.builtin.shell: lastb 2>/dev/null | awk 'NF > 3 {print $3}' | sort | uniq -c | sort -rn | head -n 10
+      ansible.builtin.shell: |
+        set -o pipefail
+        lastb 2>/dev/null | awk 'NF > 3 {print $3}' | sort | uniq -c | sort -rn | head -n 10
+      args:
+        executable: /bin/bash
       register: failure_sources
       changed_when: false
       failed_when: false

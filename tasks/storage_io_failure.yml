@@ -55,13 +55,15 @@
 
     # --- filesystem checks -----------------------------------------------
     - name: Check for filesystems remounted read-only
-      ansible.builtin.shell: >-
-        awk '$1 ~ /^\/dev\// && $4 ~ /(^|,)ro(,|$)/ {print "- "$1" on "$2" ("$4")"}' /proc/mounts
+      ansible.builtin.command:
+        cmd: >-
+          awk '$1 ~ /^\/dev\// && $4 ~ /(^|,)ro(,|$)/ {print "- "$1" on "$2" ("$4")"}' /proc/mounts
       register: ro_mounts
       changed_when: false
 
     - name: Collect local filesystem usage
-      ansible.builtin.shell: timeout 15 df -hl
+      ansible.builtin.command:
+        cmd: timeout 15 df -hl
       register: df_output
       changed_when: false
       failed_when: false
@@ -75,7 +77,8 @@
 
     # --- multipath --------------------------------------------------------
     - name: Check whether multipath is installed
-      ansible.builtin.shell: command -v multipath
+      ansible.builtin.command:
+        cmd: which multipath
       register: multipath_check
       changed_when: false
       failed_when: false
@@ -90,7 +93,8 @@
 
     # --- SMART (local disks only, passive read) ---------------------------
     - name: Check whether smartctl is installed
-      ansible.builtin.shell: command -v smartctl
+      ansible.builtin.command:
+        cmd: which smartctl
       register: smartctl_check
       changed_when: false
       failed_when: false
@@ -109,8 +113,13 @@
 
     # --- recent kernel errors ---------------------------------------------
     - name: Collect recent kernel I/O errors
-      ansible.builtin.shell: >-
-        dmesg -T | grep -iE 'i/o error|blk_update_request|buffer i/o|sense key|resetting link|device offline|not ready|rejecting i/o|failed command' | tail -n 30
+      ansible.builtin.shell: |
+        set -o pipefail
+        dmesg -T \
+          | grep -iE 'i/o error|blk_update_request|buffer i/o|sense key|resetting link|device offline|not ready|rejecting i/o|failed command' \
+          | tail -n 30
+      args:
+        executable: /bin/bash
       register: dmesg_errors
       changed_when: false
       failed_when: false

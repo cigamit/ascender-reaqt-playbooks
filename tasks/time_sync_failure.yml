@@ -23,7 +23,8 @@
       failed_when: false
 
     - name: Check whether chronyc is installed
-      ansible.builtin.shell: command -v chronyc
+      ansible.builtin.command:
+        cmd: which chronyc
       register: chronyc_check
       changed_when: false
       failed_when: false
@@ -54,7 +55,11 @@
 
     # --- source reachability ------------------------------------------------
     - name: List sources chrony cannot reach (reach register = 0)
-      ansible.builtin.shell: chronyc sources | awk '$1 ~ /^[\^=#]/ && $5 == 0 {print $2}'
+      ansible.builtin.shell: |
+        set -o pipefail
+        chronyc sources | awk '$1 ~ /^[\^=#]/ && $5 == 0 {print $2}'
+      args:
+        executable: /bin/bash
       register: unreachable_sources
       changed_when: false
       failed_when: false
@@ -120,7 +125,9 @@
           - none, all sources are being reached
           {% else %}
           {% for r in source_pings.results %}
-          - {{ r.item }}: {{ 'responds to ping - NTP (udp/123) may be blocked or the server is not serving time' if r.rc == 0 else 'does not respond to ping - host or network path is down' }}
+          {% set ping_note = 'responds to ping - NTP (udp/123) may be blocked or the server is not serving time'
+             if r.rc == 0 else 'does not respond to ping - host or network path is down' %}
+          - {{ r.item }}: {{ ping_note }}
           {% endfor %}
           {% endif %}
 

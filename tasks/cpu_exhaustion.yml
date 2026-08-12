@@ -30,14 +30,24 @@
       changed_when: false
 
     - name: Collect the top 10 CPU consumers
-      ansible.builtin.shell: ps aux --sort=-%cpu | head -n 11
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps aux --sort=-%cpu | head -n 11
+      args:
+        executable: /bin/bash
       register: top_cpu_consumers
       changed_when: false
+      failed_when: false
 
     - name: Collect a top snapshot
-      ansible.builtin.shell: top -b -n 1 | head -n 25
+      ansible.builtin.shell: |
+        set -o pipefail
+        top -b -n 1 | head -n 25
+      args:
+        executable: /bin/bash
       register: top_snapshot
       changed_when: false
+      failed_when: false
 
     - name: Collect vmstat over 5 seconds
       ansible.builtin.command:
@@ -53,20 +63,35 @@
       failed_when: false
 
     - name: Count total processes
-      ansible.builtin.shell: ps -e --no-headers | wc -l
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -e --no-headers | wc -l
+      args:
+        executable: /bin/bash
       register: total_procs
       changed_when: false
+      failed_when: false
 
     - name: Count processes per command
-      ansible.builtin.shell: ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 5
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 5
+      args:
+        executable: /bin/bash
       register: proc_counts
       changed_when: false
+      failed_when: false
 
     # --- identify runaway process ------------------------------------------
     - name: Identify the top CPU process
-      ansible.builtin.shell: ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | head -n 1
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | head -n 1
+      args:
+        executable: /bin/bash
       register: top_cpu_proc
       changed_when: false
+      failed_when: false
 
     - name: Record the top CPU consumer details
       ansible.builtin.set_fact:
@@ -135,7 +160,9 @@
           {% if runaway_unit | length > 0 %}
           - Owning systemd unit: {{ runaway_unit }}
           {% if runaway_restart is defined and runaway_restart is not skipped %}
-          - {{ runaway_unit }} is on the safe restart list: {{ 'restarted' if not runaway_restart.failed | default(false) else 'restart FAILED - ' ~ runaway_restart.msg | default('') }}
+          {% set restart_note = 'restarted' if not runaway_restart.failed | default(false)
+             else 'restart FAILED - ' ~ runaway_restart.msg | default('') %}
+          - {{ runaway_unit }} is on the safe restart list: {{ restart_note }}
           {% else %}
           - {{ runaway_unit }} is not on the safe restart list, so it was not restarted.
           {% endif %}

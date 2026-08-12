@@ -15,9 +15,14 @@
   block:
     # --- current usage vs limits ----------------------------------------
     - name: Count processes and threads
-      ansible.builtin.shell: echo "$(ps -e --no-headers | wc -l) $(ps -eL --no-headers | wc -l)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "$(ps -e --no-headers | wc -l) $(ps -eL --no-headers | wc -l)"
+      args:
+        executable: /bin/bash
       register: proc_thread_counts
       changed_when: false
+      failed_when: false
 
     - name: Record process and thread counts
       ansible.builtin.set_fact:
@@ -49,22 +54,36 @@
 
     # --- who is consuming the PIDs ------------------------------------------
     - name: Count processes per command
-      ansible.builtin.shell: ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 15
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -n 15
+      args:
+        executable: /bin/bash
       register: procs_by_command
       changed_when: false
+      failed_when: false
 
     - name: Count processes per user
-      ansible.builtin.shell: ps -eo user= | sort | uniq -c | sort -rn | head -n 10
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -eo user= | sort | uniq -c | sort -rn | head -n 10
+      args:
+        executable: /bin/bash
       register: procs_by_user
       changed_when: false
+      failed_when: false
 
     - name: Find the parents with the most children
       ansible.builtin.shell: |
+        set -o pipefail
         ps -eo ppid= | sort | uniq -c | sort -rn | head -n 5 | while read n ppid; do
           echo "$n children <- PPID $ppid ($(ps -p $ppid -o comm= 2>/dev/null | tr -d ' '))"
         done
+      args:
+        executable: /bin/bash
       register: top_parents
       changed_when: false
+      failed_when: false
 
     - name: Record the user with the most processes
       ansible.builtin.set_fact:
@@ -74,9 +93,11 @@
         fields: "{{ (procs_by_user.stdout_lines | first | default('')).split() }}"
 
     - name: Read the top user's process limit (RLIMIT_NPROC)
-      ansible.builtin.shell: >-
-        awk '/Max processes/ {print $3}'
-        /proc/$(ps -u {{ top_user }} -o pid= | head -n 1 | tr -d ' ')/limits
+      ansible.builtin.shell: |
+        set -o pipefail
+        awk '/Max processes/ {print $3}' /proc/$(ps -u {{ top_user }} -o pid= | head -n 1 | tr -d ' ')/limits
+      args:
+        executable: /bin/bash
       register: top_user_nproc
       changed_when: false
       failed_when: false
@@ -85,6 +106,7 @@
     # --- cgroup pids limits (TasksMax / container limits) ---------------------
     - name: Find cgroups close to their pids limit
       ansible.builtin.shell: |
+        set -o pipefail
         find /sys/fs/cgroup -name pids.current 2>/dev/null | while read f; do
           c=$(cat "$f" 2>/dev/null || echo 0)
           m=$(cat "${f%current}max" 2>/dev/null || echo max)
@@ -93,16 +115,21 @@
             [ "$pct" -ge 80 ] && echo "$c of $m ($pct%) ${f%/pids.current}"
           fi
         done | sort -rn | head -n 10
+      args:
+        executable: /bin/bash
       register: cgroups_near_limit
       changed_when: false
       failed_when: false
 
     - name: List the cgroups with the most PIDs
       ansible.builtin.shell: |
+        set -o pipefail
         find /sys/fs/cgroup -name pids.current 2>/dev/null | while read f; do
           c=$(cat "$f" 2>/dev/null || echo 0)
           [ "$c" -gt 25 ] && echo "$c ${f%/pids.current}"
         done | sort -rn | head -n 10
+      args:
+        executable: /bin/bash
       register: cgroups_by_pids
       changed_when: false
       failed_when: false
@@ -127,7 +154,8 @@
           Cgroups at 80%+ of their pids limit (too-low TasksMax / container PID limits show up here):
           {{ cgroups_near_limit.stdout | default('') | trim | default('- none', true) }}
 
-          Top user: {{ top_user }} with {{ top_user_count }} processes (their RLIMIT_NPROC: {{ top_user_nproc.stdout | default('?') | trim | default('?', true) }})
+          {% set top_user_limit = top_user_nproc.stdout | default('?') | trim | default('?', true) %}
+          Top user: {{ top_user }} with {{ top_user_count }} processes (their RLIMIT_NPROC: {{ top_user_limit }})
 
           Parents with the most children (one parent with a huge brood = fork bomb;
           many same-named siblings under init/systemd = leaking worker pool):

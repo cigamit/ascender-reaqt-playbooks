@@ -21,7 +21,8 @@
       failed_when: false
 
     - name: List md arrays on this host
-      ansible.builtin.shell: awk '/^md/ {print $1}' /proc/mdstat
+      ansible.builtin.command:
+        cmd: awk '/^md/ {print $1}' /proc/mdstat
       register: md_arrays
       changed_when: false
       failed_when: false

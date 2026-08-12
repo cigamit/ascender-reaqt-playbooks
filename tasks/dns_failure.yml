@@ -39,7 +39,11 @@
       ansible.builtin.service_facts:
 
     - name: Collect DNS configuration from NetworkManager
-      ansible.builtin.shell: nmcli dev show 2>/dev/null | grep -E 'GENERAL.DEVICE|IP4.DNS|IP6.DNS'
+      ansible.builtin.shell: |
+        set -o pipefail
+        nmcli dev show 2>/dev/null | grep -E 'GENERAL.DEVICE|IP4.DNS|IP6.DNS'
+      args:
+        executable: /bin/bash
       register: nmcli_dns
       changed_when: false
       failed_when: false
@@ -58,7 +62,8 @@
         dns_broken: "{{ dns_tests.results | selectattr('rc', 'ne', 0) | list | length > 0 }}"
 
     - name: Check whether dig is installed
-      ansible.builtin.shell: command -v dig
+      ansible.builtin.command:
+        cmd: which dig
       register: dig_check
       changed_when: false
       failed_when: false
@@ -118,7 +123,11 @@
           Nameserver tests (dig, 3s timeout):
           {% if server_tests is not skipped %}
           {% for r in server_tests.results %}
-          - @{{ r.item.0 }} {{ r.item.1 }}: {{ 'OK (' ~ (r.stdout_lines | first | default('no answer')) ~ ')' if r.rc == 0 and r.stdout | length > 0 else 'FAILED' }}{{ ' (normal if no local resolver is running)' if r.item.0 == '127.0.0.1' and (r.rc != 0 or r.stdout | length == 0) and '127.0.0.1' not in dns_nameservers else '' }}
+          {% set ok = r.rc == 0 and r.stdout | length > 0 %}
+          {% set verdict = 'OK (' ~ (r.stdout_lines | first | default('no answer')) ~ ')' if ok else 'FAILED' %}
+          {% set localhost_note = ' (normal if no local resolver is running)'
+             if r.item.0 == '127.0.0.1' and not ok and '127.0.0.1' not in dns_nameservers else '' %}
+          - @{{ r.item.0 }} {{ r.item.1 }}: {{ verdict }}{{ localhost_note }}
           {% endfor %}
           {% else %}
           - Skipped: dig is not installed (install bind-utils to include this).
