@@ -15,7 +15,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Name resolution failing
             condition:
@@ -43,7 +43,7 @@
             minutes: 1
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Failed logins / locked accounts
             condition:
@@ -71,7 +71,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Disk Warning
             condition:
@@ -99,7 +99,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Systemd service failed
             condition:
@@ -128,7 +128,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Out of memory / OOM killer
             condition:
@@ -154,7 +154,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Lockups / hung tasks / stalls
             condition:
@@ -182,7 +182,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Disk / storage I/O errors
             condition:
@@ -213,7 +213,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Clock not synchronising
             condition:
@@ -241,7 +241,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Software RAID degraded / rebuilding
             condition:
@@ -272,7 +272,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: LVM activation / missing PV problems
             condition:
@@ -299,7 +299,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Kernel oops / panic / GPF
             condition:
@@ -328,7 +328,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Too many open files
             condition:
@@ -354,7 +354,7 @@
             minutes: 10
         provider:
           name: Ascender Server
-          template: 34
+          template: 41
         rule:
           - name: Cannot fork / pids limit
             condition:
