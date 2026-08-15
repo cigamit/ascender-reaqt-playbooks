@@ -1,8 +1,9 @@
 ---
 - name: Validate data passed from Reaqt
-  hosts: localhost
+  hosts: all
   gather_facts: false
   connection: local
+  run_once: true
   tasks:
     - name: Ensure a limit was passed to the job
       ansible.builtin.assert:
