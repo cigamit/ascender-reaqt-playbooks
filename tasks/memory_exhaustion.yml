@@ -96,4 +96,3 @@
           [Reaqt] Memory exhaustion on {{ inventory_hostname }}{{
           ' - killed ' ~ killed_process if killed_pid | length > 0 else '' }}
         body: "{{ memory_report_body }}"
-      become: false

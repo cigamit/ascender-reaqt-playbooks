@@ -209,4 +209,3 @@
           [Reaqt] CPU/resource exhaustion on {{ inventory_hostname }}{{
           ' - runaway ' ~ runaway_comm if runaway_detected | bool else '' }}
         body: "{{ cpu_report_body }}"
-      become: false

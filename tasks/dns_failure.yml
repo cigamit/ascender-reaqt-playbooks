@@ -166,4 +166,3 @@
       vars:
         subject: "[Reaqt] DNS resolution failure on {{ inventory_hostname }}"
         body: "{{ dns_report_body }}"
-      become: false

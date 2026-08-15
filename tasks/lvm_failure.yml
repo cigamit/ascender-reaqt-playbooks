@@ -104,4 +104,3 @@
       vars:
         subject: "[Reaqt] LVM problem on {{ inventory_hostname }}"
         body: "{{ lvm_report_body }}"
-      become: false

@@ -180,4 +180,3 @@
       vars:
         subject: "[Reaqt] PID/process exhaustion on {{ inventory_hostname }}"
         body: "{{ pid_report_body }}"
-      become: false

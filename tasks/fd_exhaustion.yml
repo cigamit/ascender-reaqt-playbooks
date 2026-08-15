@@ -192,4 +192,3 @@
           [Reaqt] FD exhaustion on {{ inventory_hostname }}{{
           ' - ' ~ culprit_name if culprit_name | length > 0 else '' }}
         body: "{{ fd_report_body }}"
-      become: false

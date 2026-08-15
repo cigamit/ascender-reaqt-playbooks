@@ -75,4 +75,3 @@
           [Reaqt] RAID problem on {{ inventory_hostname }}{{
           ' - ' ~ failing_array if failing_array | length > 0 else '' }}
         body: "{{ raid_report_body }}"
-      become: false

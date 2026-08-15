@@ -59,7 +59,6 @@
       vars:
         subject: "[Reaqt] Service failure on {{ inventory_hostname }}: {{ failed_service if failed_service | length > 0 else 'unknown service' }}"
         body: "{{ service_report_body }}"
-      become: false
 
     - name: Fail the job when no service name could be parsed
       ansible.builtin.fail:

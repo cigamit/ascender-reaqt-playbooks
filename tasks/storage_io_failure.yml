@@ -184,4 +184,3 @@
           [Reaqt] Storage I/O errors on {{ inventory_hostname }}{{
           ' - ' ~ base_device if failing_device | length > 0 else '' }}
         body: "{{ storage_report_body }}"
-      become: false

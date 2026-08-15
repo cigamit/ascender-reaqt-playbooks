@@ -241,4 +241,3 @@
       vars:
         subject: "[Reaqt] Disk remediation on {{ inventory_hostname }}"
         body: "{{ disk_report_body }}"
-      become: false

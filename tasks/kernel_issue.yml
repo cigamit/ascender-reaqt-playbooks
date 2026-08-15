@@ -153,4 +153,3 @@
       vars:
         subject: "[Reaqt] Kernel issue on {{ inventory_hostname }}"
         body: "{{ kernel_report_body }}"
-      become: false

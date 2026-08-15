@@ -92,4 +92,3 @@
           ' - user ' ~ auth_user if auth_user | length > 0 else '' }}{{
           ' from ' ~ auth_source if auth_source | length > 0 else '' }}
         body: "{{ auth_report_body }}"
-      become: false
