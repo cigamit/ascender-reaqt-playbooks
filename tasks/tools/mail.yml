@@ -7,4 +7,5 @@
     to: "{{ mail_to }}"
     subject: "{{ subject }}"
     body: "{{ body }}"
+    sender: "{{ mail_from }}"
   delegate_to: localhost
